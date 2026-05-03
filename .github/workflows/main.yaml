@@ -186,6 +186,8 @@ jobs:
   compliance-checkov:
     runs-on: ubuntu-22.04
     needs: test
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4.2.2
