@@ -24,10 +24,10 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4   # updated from v2
+      - uses: actions/checkout@v4.2.2   # updated from v2
 
       - name: Set up Python
-        uses: actions/setup-python@v5   # updated from v2
+        uses: actions/setup-python@v5.6.0   # updated from v2
         with:
           python-version: '3.11'         # updated from EOL 3.6
 
