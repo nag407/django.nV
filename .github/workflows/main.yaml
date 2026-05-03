@@ -182,13 +182,44 @@ jobs:
           name: gitleaks-results
           path: results.sarif
           retention-days: 14
+          
+  compliance-checkov:
+    runs-on: ubuntu-22.04
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Run Checkov compliance scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,github_actions
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: Upload Checkov SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Upload Checkov artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: checkov-results
+          path: checkov.sarif
+          retention-days: 14
 
   # ────────────────────────────────
   # 4. INTEGRATION (stub)
   # ────────────────────────────────
   integration:
     runs-on: ubuntu-22.04
-    needs: [oast-snyk,sast-semgrep,secret-scanning]
+    needs: [oast-snyk,sast-semgrep,secret-scanning,compliance-checkov]
     steps:
       - name: Integration smoke test
         run: echo "Integration step — replace with real smoke test"
