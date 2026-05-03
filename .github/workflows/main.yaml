@@ -131,6 +131,13 @@ jobs:
   sast-semgrep:
     runs-on: ubuntu-22.04
     needs: test                  # runs in parallel with Snyk
+    container:
+      image: returntocorp/semgrep
+    if: (github.actor != 'dependabot[bot]')
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -141,7 +148,7 @@ jobs:
             p/django
             p/python
             p/owasp-top-ten
-            p/secrets
+            p/secrets > semgrep.sarif
           
         continue-on-error: true
         # Add this only if you have a Semgrep Cloud account:
