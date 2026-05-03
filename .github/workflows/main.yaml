@@ -77,10 +77,7 @@ jobs:
 
       - name: Run Snyk SCA scan
         run: |
-          snyk test --file=requirements.txt \
-            --package-manager=pip \
-            --json \
-            > snyk-results.json || true
+          snyk test --file=requirements.txt --package-manager=pip  --json  > snyk-results.json 
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
