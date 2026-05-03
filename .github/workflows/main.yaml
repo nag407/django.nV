@@ -70,11 +70,14 @@ jobs:
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
 
+      - name: Authenticate Snyk
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
       - name: Run Snyk SCA scan
         run: |
-          snyk auth $SNYK_TOKEN
-          snyk test \
-            --file=requirements.txt \
+          snyk test --file=requirements.txt \
             --package-manager=pip \
             --json \
             > snyk-results.json || true
