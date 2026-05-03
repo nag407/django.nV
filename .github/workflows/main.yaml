@@ -161,13 +161,34 @@ jobs:
           name: semgrep-results
           path: semgrep.sarif
           retention-days: 14
+          
+  secret-scanning:
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0               # full git history scan
+      - name: Run Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload Gitleaks results
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: gitleaks-results
+          path: results.sarif
+          retention-days: 14
 
   # ────────────────────────────────
   # 4. INTEGRATION (stub)
   # ────────────────────────────────
   integration:
     runs-on: ubuntu-22.04
-    needs: oast-snyk
+    needs: [oast-snyk,sast-semgrep,secret-scanning]
     steps:
       - name: Integration smoke test
         run: echo "Integration step — replace with real smoke test"
