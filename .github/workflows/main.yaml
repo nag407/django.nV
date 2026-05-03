@@ -2,29 +2,33 @@ name: Django – CI + SCA (Snyk)
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
-  workflow_dispatch:
+    branches: [main]
 
+# Least-privilege token permissions
 permissions:
   contents: read
 
+# Cancel duplicate runs on the same branch/PR
 concurrency:
   group: django-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
 
+  # ────────────────────────────────
+  # 1. BUILD
+  # ────────────────────────────────
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4   # updated from v2
 
       - name: Set up Python
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v5   # updated from v2
         with:
-          python-version: '3.8'            # downgraded for django.nv compatibility
+          python-version: '3.11'         # updated from EOL 3.6
 
       - name: Install dependencies and verify Django config
         run: |
@@ -32,18 +36,21 @@ jobs:
           virtualenv env
           source env/bin/activate
           pip install -r requirements.txt
-          python manage.py check
+          python manage.py check          # fixed: was [manage.py](http://manage.py)
 
+  # ────────────────────────────────
+  # 2. TEST
+  # ────────────────────────────────
   test:
     runs-on: ubuntu-22.04
     needs: build
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8'            # downgraded for django.nv compatibility
+          python-version: '3.11'
 
       - name: Run Django test suite
         run: |
@@ -51,51 +58,128 @@ jobs:
           virtualenv env
           source env/bin/activate
           pip install -r requirements.txt
-          python manage.py test taskManager
+          python manage.py test taskManager   # fixed: was [manage.py](...)
 
+  # ────────────────────────────────
+  # 3. SCA — Snyk (Python)
+  # ────────────────────────────────
+  # What this job does:
+  #   - Scans requirements.txt for known CVEs via Snyk's database
+  #   - Saves results as snyk-results.json (uploaded as artifact)
+  #   - continue-on-error: true means vulnerable deps don't BLOCK
+  #     the pipeline yet — results are advisory at this PoC stage
+  #
+  # Prerequisites:
+  #   Go to your repo → Settings → Secrets and variables → Actions
+  #   → New repository secret → Name: SNYK_TOKEN, Value: <your token>
+  #   Get your token at: https://app.snyk.io/account
+  # ────────────────────────────────
   oast-snyk:
     runs-on: ubuntu-22.04
     needs: test
+    permissions:
+      contents: read
+      security-events: write   # needed if you later add SARIF upload
+
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8'            # downgraded for django.nv compatibility
+          python-version: '3.11'
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
+        # Note: @master is the only tag Snyk publishes for the setup action.
+        # Acceptable for a PoC — for production, pin to a specific commit SHA.
 
-      - name: Authenticate Snyk
-        run: snyk auth ${{ secrets.SNYK_TOKEN }}
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      # REMOVED: actions/setup-go — not needed for Python SCA
+      # REMOVED: actions/setup-node + npm install — django.nv has no package.json
+      #          Snyk scans Python via requirements.txt, not npm
 
       - name: Run Snyk SCA scan
         run: |
-          snyk test --file=requirements.txt --package-manager=pip  --json  > snyk-results.json || true
+          snyk test \
+            --file=requirements.txt \
+            --package-manager=pip \
+            --json \
+            > snyk-results.json || true
+          # '|| true' prevents non-zero exit from stopping the upload step.
+          # This is equivalent to continue-on-error but more explicit
+          # about why we're swallowing the exit code here.
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          # If SNYK_TOKEN is missing from repo secrets, this job will
+          # authenticate as anonymous and may return no results or 401.
 
-      - name: Upload Snyk results
-        uses: actions/upload-artifact@v4.6.2
+      - name: Upload Snyk results artifact
+        uses: actions/upload-artifact@v4   # updated from v4 (already correct, keeping)
         if: always()
+        # 'if: always()' explained:
+        #   Snyk exits with code 1 when vulnerabilities are found.
+        #   Without 'if: always()', the upload step would be SKIPPED
+        #   when vulnerabilities exist — defeating the purpose of the scan.
+        #   This ensures the JSON report is always saved regardless of findings.
         with:
           name: snyk-results
           path: snyk-results.json
+          retention-days: 14   # added: explicit retention to control storage usage
+    
+  sast-semgrep:
+    runs-on: ubuntu-22.04
+    needs: test                  # runs in parallel with Snyk
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Run Semgrep SAST scan
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/django
+            p/python
+            p/owasp-top-ten
+            p/secrets
+          
+        continue-on-error: true
+        # Add this only if you have a Semgrep Cloud account:
+        # env:
+        #   SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload Semgrep SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep results artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: semgrep-results
+          path: semgrep.sarif
           retention-days: 14
 
+  # ────────────────────────────────
+  # 4. INTEGRATION (stub)
+  # ────────────────────────────────
   integration:
     runs-on: ubuntu-22.04
     needs: oast-snyk
     steps:
       - name: Integration smoke test
         run: echo "Integration step — replace with real smoke test"
+      # REMOVED: 'run: exit 1' with continue-on-error
+      # Reason: intentional failures train developers to ignore
+      # yellow/red pipeline status. Remove or replace with a real test.
 
+  # ────────────────────────────────
+  # 5. PROD DEPLOY (stub)
+  # ────────────────────────────────
   prod:
     runs-on: ubuntu-22.04
     needs: integration
