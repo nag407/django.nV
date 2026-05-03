@@ -216,13 +216,163 @@ jobs:
           name: checkov-results
           path: checkov.sarif
           retention-days: 14
+  quality-gate:
+    runs-on: ubuntu-22.04
+    needs: [oast-snyk, sast-semgrep, secret-scanning,compliance-checkov]
+    if: always()
 
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+
+      - name: Evaluate quality gates
+        run: |
+          python3 << 'EOF'
+          import json, os, sys
+
+          RESULTS_DIR = "scan-results"
+          failures = []
+          warnings = []
+
+          print("=" * 60)
+          print("QUALITY GATE EVALUATION")
+          print("=" * 60)
+
+          # ──────────────────────────────
+          # GATE 1: Snyk SCA
+          # ──────────────────────────────
+          snyk_file = f"{RESULTS_DIR}/snyk-results/snyk-results.json"
+          if os.path.exists(snyk_file):
+              with open(snyk_file) as f:
+                  data = json.load(f)
+              vulns = data.get("vulnerabilities", [])
+              critical = [v for v in vulns if v.get("severity") == "critical"]
+              high     = [v for v in vulns if v.get("severity") == "high"]
+              medium   = [v for v in vulns if v.get("severity") == "medium"]
+
+              print(f"\n[SCA - Snyk]")
+              print(f"  Critical : {len(critical)}")
+              print(f"  High     : {len(high)}")
+              print(f"  Medium   : {len(medium)}")
+
+              if len(critical) > 0:
+                  failures.append(f"SCA: {len(critical)} CRITICAL vulnerabilities found (threshold: 0)")
+              if len(high) > 5:
+                  warnings.append(f"SCA: {len(high)} HIGH vulnerabilities found (threshold: 5)")
+          else:
+              warnings.append("SCA: snyk-results.json not found — scan may have failed")
+
+          # ──────────────────────────────
+          # GATE 2: Semgrep SAST
+          # ──────────────────────────────
+          import xml.etree.ElementTree as ET
+
+          semgrep_file = f"{RESULTS_DIR}/semgrep-results/semgrep.sarif"
+          if os.path.exists(semgrep_file):
+              with open(semgrep_file) as f:
+                  sarif = json.load(f)
+
+              results = []
+              for run in sarif.get("runs", []):
+                  results.extend(run.get("results", []))
+
+              sast_high     = [r for r in results if r.get("level") == "error"]
+              sast_medium   = [r for r in results if r.get("level") == "warning"]
+              sast_low      = [r for r in results if r.get("level") == "note"]
+
+              print(f"\n[SAST - Semgrep]")
+              print(f"  High/Error   : {len(sast_high)}")
+              print(f"  Medium/Warn  : {len(sast_medium)}")
+              print(f"  Low/Note     : {len(sast_low)}")
+
+              if len(sast_high) > 0:
+                  failures.append(f"SAST: {len(sast_high)} HIGH/ERROR findings found (threshold: 0)")
+              if len(sast_medium) > 10:
+                  warnings.append(f"SAST: {len(sast_medium)} MEDIUM findings (threshold: 10)")
+          else:
+              warnings.append("SAST: semgrep.sarif not found — scan may have failed")
+
+          # ──────────────────────────────
+          # GATE 3: Gitleaks Secrets
+          # Zero tolerance — any secret = block
+          # ──────────────────────────────
+          secrets_file = f"{RESULTS_DIR}/gitleaks-results/results.sarif"
+          if os.path.exists(secrets_file):
+              with open(secrets_file) as f:
+                  sarif = json.load(f)
+
+              secrets_found = []
+              for run in sarif.get("runs", []):
+                  secrets_found.extend(run.get("results", []))
+
+              print(f"\n[Secrets - Gitleaks]")
+              print(f"  Secrets found: {len(secrets_found)}")
+
+              if len(secrets_found) > 0:
+                  failures.append(f"SECRETS: {len(secrets_found)} secret(s) detected — zero tolerance policy")
+          else:
+              warnings.append("Secrets: results.sarif not found — scan may have failed")
+          # ──────────────────────────────
+          # GATE 5: Checkov Compliance
+          # ──────────────────────────────
+          checkov_file = f"{RESULTS_DIR}/checkov-results/checkov.sarif"
+          if os.path.exists(checkov_file):
+              with open(checkov_file) as f:
+                  sarif = json.load(f)
+
+              checkov_results = []
+              for run in sarif.get("runs", []):
+                  checkov_results.extend(run.get("results", []))
+
+              checkov_critical = [r for r in checkov_results if r.get("level") == "error"]
+              checkov_high     = [r for r in checkov_results if r.get("level") == "warning"]
+
+              print(f"\n[Compliance - Checkov]")
+              print(f"  Critical/Error : {len(checkov_critical)}")
+              print(f"  High/Warning   : {len(checkov_high)}")
+
+              if len(checkov_critical) > 0:
+                  failures.append(f"COMPLIANCE: {len(checkov_critical)} CRITICAL misconfigurations (threshold: 0)")
+              if len(checkov_high) > 5:
+                  warnings.append(f"COMPLIANCE: {len(checkov_high)} HIGH misconfigs (threshold: 5)")
+          else:
+              warnings.append("Compliance: checkov.sarif not found — scan may have failed")
+
+          # ──────────────────────────────
+          # FINAL VERDICT
+          # ──────────────────────────────
+          print("\n" + "=" * 60)
+          print("GATE SUMMARY")
+          print("=" * 60)
+
+          if warnings:
+              print("\nWARNINGS:")
+              for w in warnings:
+                  print(f"  ⚠  {w}")
+
+          if failures:
+              print("\nBLOCKERS:")
+              for f in failures:
+                  print(f"  ✖  {f}")
+              print("\n" + "=" * 60)
+              print("QUALITY GATE: FAILED — merge is blocked")
+              print("=" * 60)
+              sys.exit(1)
+          else:
+              print("\n" + "=" * 60)
+              print("QUALITY GATE: PASSED — pipeline may proceed")
+              print("=" * 60)
+              sys.exit(0)
+
+          EOF      
   # ────────────────────────────────
   # 4. INTEGRATION (stub)
   # ────────────────────────────────
   integration:
     runs-on: ubuntu-22.04
-    needs: [oast-snyk,sast-semgrep,secret-scanning,compliance-checkov]
+    needs: quality-gate
     steps:
       - name: Integration smoke test
         run: echo "Integration step — replace with real smoke test"
