@@ -141,7 +141,7 @@ jobs:
 
     steps:
       - name: Perform Semgrep Analysis
-        run: semgrep scan -q --sarif --config auto ./vulnerable-source-code > semgrep.sarif 
+        run: semgrep scan -q --sarif --config "p/django" --config "p/python" --output semgrep.sarif 
         continue-on-error: true
         # Add this only if you have a Semgrep Cloud account:
         # env:
