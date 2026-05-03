@@ -2,10 +2,11 @@ name: Django – CI + SCA (Snyk)
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
-
+    branches: [master]
+  workflow_dispatch:
+    
 # Least-privilege token permissions
 permissions:
   contents: read
