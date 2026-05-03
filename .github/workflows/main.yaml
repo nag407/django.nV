@@ -140,16 +140,8 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4.2.2
-      - name: Run Semgrep SAST scan
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: >-
-            p/django
-            p/python
-            p/owasp-top-ten
-            p/secrets > semgrep.sarif
-          
+      - name: Perform Semgrep Analysis
+        run: semgrep scan -q --sarif --config auto ./vulnerable-source-code > semgrep.sarif 
         continue-on-error: true
         # Add this only if you have a Semgrep Cloud account:
         # env:
