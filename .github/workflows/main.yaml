@@ -199,13 +199,14 @@ jobs:
         with:
           category: "/language:python"
           upload: true
+          output: codeql-results
 
       - name: Upload CodeQL artifact
         uses: actions/upload-artifact@v4.6.2
         if: always()
         with:
           name: codeql-results
-          path: /home/runner/work/_temp/codeql_databases
+          path: codeql-results/
           retention-days: 14
           
   secret-scanning:
@@ -244,15 +245,26 @@ jobs:
           directory: .
           framework: dockerfile,github_actions
           output_format: sarif
-          output_file_path: checkov.sarif
+          output_file_path: .
           soft_fail: true
         continue-on-error: true
+        
+      - name: Verify Checkov output
+        if: always()
+        run: |
+          echo "=== Files in current directory ==="
+          ls -la *.sarif 2>/dev/null || echo "No SARIF files found"
+          echo "=== All SARIF files in workspace ==="
+          find . -name "*.sarif" 2>/dev/null
+          echo "=== Checkov output files ==="
+          find . -name "results_sarif.sarif" 2>/dev/null
+          find . -name "checkov.sarif" 2>/dev/null
 
       - name: Upload Checkov SARIF to Security tab
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         with:
-          sarif_file: checkov.sarif
+          sarif_file: results_sarif.sarif 
           category: checkov
 
       - name: Upload Checkov artifact
@@ -260,12 +272,15 @@ jobs:
         if: always()
         with:
           name: checkov-results
-          path: checkov.sarif
+          path: results_sarif.sarif 
           retention-days: 14
           
   quality-gate:
     runs-on: ubuntu-22.04
     needs: [oast-snyk, sast-semgrep,sast-codeql, secret-scanning,compliance-checkov]
+    permissions:
+      contents: read
+      security-events: read
     if: always()
 
     steps:
@@ -432,8 +447,18 @@ jobs:
           # ──────────────────────────────
           # GATE 5: Checkov Compliance
           # ──────────────────────────────
-          checkov_file = f"{RESULTS_DIR}/checkov-results/checkov.sarif"
-          if os.path.exists(checkov_file):
+          checkov_file = None
+          possible_paths = [
+              f"{RESULTS_DIR}/checkov-results/results_sarif.sarif",
+              f"{RESULTS_DIR}/checkov-results/checkov.sarif",
+          ]
+          for path in possible_paths:
+              if os.path.exists(path):
+                  checkov_file = path
+                  break
+
+          print(f"\n[Compliance - Checkov]")
+          if checkov_file:
               with open(checkov_file) as f:
                   sarif = json.load(f)
 
@@ -441,19 +466,27 @@ jobs:
               for run in sarif.get("runs", []):
                   checkov_results.extend(run.get("results", []))
 
-              checkov_critical = [r for r in checkov_results if r.get("level") == "error"]
-              checkov_high     = [r for r in checkov_results if r.get("level") == "warning"]
+              checkov_error   = [r for r in checkov_results if r.get("level") == "error"]
+              checkov_warning = [r for r in checkov_results if r.get("level") == "warning"]
 
-              print(f"\n[Compliance - Checkov]")
-              print(f"  Critical/Error : {len(checkov_critical)}")
-              print(f"  High/Warning   : {len(checkov_high)}")
+              print(f"  Critical/Error  : {len(checkov_error)}")
+              print(f"  High/Warning    : {len(checkov_warning)}")
 
-              if len(checkov_critical) > 0:
-                  failures.append(f"COMPLIANCE: {len(checkov_critical)} CRITICAL misconfigurations (threshold: 0)")
-              if len(checkov_high) > 5:
-                  warnings.append(f"COMPLIANCE: {len(checkov_high)} HIGH misconfigs (threshold: 5)")
+              if len(checkov_error) > 0:
+                  failures.append(
+                      f"COMPLIANCE: {len(checkov_error)} CRITICAL misconfigurations "
+                      f"(threshold: 0)"
+                  )
+              if len(checkov_warning) > 5:
+                  warnings.append(
+                      f"COMPLIANCE: {len(checkov_warning)} HIGH misconfigs "
+                      f"(threshold: 5)"
+                  )
           else:
-              warnings.append("Compliance: checkov.sarif not found — scan may have failed")
+              warnings.append(
+                  "Compliance: no Checkov SARIF found — "
+                  "checked results_sarif.sarif and checkov.sarif"
+              )
 
           # ──────────────────────────────
           # FINAL VERDICT
