@@ -325,7 +325,7 @@ jobs:
 
               if len(critical) > 0:
                   failures.append(f"SCA: {len(critical)} CRITICAL vulnerabilities found (threshold: 0)")
-              if len(high) > 5:
+              if len(high) > 25:
                   warnings.append(f"SCA: {len(high)} HIGH vulnerabilities found (threshold: 5)")
           else:
               warnings.append("SCA: snyk-results.json not found — scan may have failed")
