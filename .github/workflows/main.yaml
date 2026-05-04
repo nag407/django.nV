@@ -163,6 +163,52 @@ jobs:
           name: semgrep-results
           path: semgrep.sarif
           retention-days: 14
+
+  sast-codeql:
+    runs-on: ubuntu-22.04
+    needs: test
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 2             # CodeQL needs git history
+
+      # Step 1 — Initialise CodeQL database
+      # CodeQL compiles your code into a queryable
+      # semantic database before scanning
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-extended → 50% more rules than default
+          # security-and-quality → adds maintainability checks
+          queries: security-extended,security-and-quality
+
+      # Step 2 — Build the code model
+      # For Python this is automatic
+      # For Java/C++ this compiles the source
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      # Step 3 — Run all queries against the database
+      # Automatically uploads SARIF to Security tab
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+          upload: true
+
+      - name: Upload CodeQL artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: codeql-results
+          path: /home/runner/work/_temp/codeql_databases
+          retention-days: 14
           
   secret-scanning:
     runs-on: ubuntu-22.04
@@ -215,9 +261,10 @@ jobs:
           name: checkov-results
           path: checkov.sarif
           retention-days: 14
+          
   quality-gate:
     runs-on: ubuntu-22.04
-    needs: [oast-snyk, sast-semgrep, secret-scanning,compliance-checkov]
+    needs: [oast-snyk, sast-semgrep,sast-codeql, secret-scanning,compliance-checkov]
     if: always()
 
     steps:
@@ -227,6 +274,10 @@ jobs:
           path: scan-results
 
       - name: Evaluate quality gates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # for CodeQL API query
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           python3 << 'EOF'
           import json, os, sys
@@ -263,35 +314,99 @@ jobs:
           else:
               warnings.append("SCA: snyk-results.json not found — scan may have failed")
 
+      
           # ──────────────────────────────
-          # GATE 2: Semgrep SAST
+          # GATE 2a: Semgrep SAST
           # ──────────────────────────────
-          import xml.etree.ElementTree as ET
-
           semgrep_file = f"{RESULTS_DIR}/semgrep-results/semgrep.sarif"
           if os.path.exists(semgrep_file):
               with open(semgrep_file) as f:
                   sarif = json.load(f)
-
               results = []
               for run in sarif.get("runs", []):
                   results.extend(run.get("results", []))
 
-              sast_high     = [r for r in results if r.get("level") == "error"]
-              sast_medium   = [r for r in results if r.get("level") == "warning"]
-              sast_low      = [r for r in results if r.get("level") == "note"]
+              semgrep_error   = [r for r in results if r.get("level") == "error"]
+              semgrep_warning = [r for r in results if r.get("level") == "warning"]
+              semgrep_note    = [r for r in results if r.get("level") == "note"]
 
               print(f"\n[SAST - Semgrep]")
-              print(f"  High/Error   : {len(sast_high)}")
-              print(f"  Medium/Warn  : {len(sast_medium)}")
-              print(f"  Low/Note     : {len(sast_low)}")
+              print(f"  Error   (High)   : {len(semgrep_error)}")
+              print(f"  Warning (Medium) : {len(semgrep_warning)}")
+              print(f"  Note    (Low)    : {len(semgrep_note)}")
 
-              if len(sast_high) > 0:
-                  failures.append(f"SAST: {len(sast_high)} HIGH/ERROR findings found (threshold: 0)")
-              if len(sast_medium) > 10:
-                  warnings.append(f"SAST: {len(sast_medium)} MEDIUM findings (threshold: 10)")
+              if len(semgrep_error) > 0:
+                  failures.append(
+                      f"SAST Semgrep: {len(semgrep_error)} HIGH/ERROR findings "
+                      f"(threshold: 0)"
+                  )
+              if len(semgrep_warning) > 10:
+                  warnings.append(
+                      f"SAST Semgrep: {len(semgrep_warning)} MEDIUM findings "
+                      f"(threshold: 10)"
+                  )
           else:
-              warnings.append("SAST: semgrep.sarif not found — scan may have failed")
+              warnings.append("SAST Semgrep: semgrep.sarif not found")
+
+          # ──────────────────────────────
+          # GATE 2b: CodeQL SAST
+          # CodeQL uploads directly to Security tab
+          # We query the GitHub API to read results
+          # ──────────────────────────────
+          print(f"\n[SAST - CodeQL]")
+          import urllib.request, urllib.error
+
+          try:
+              token = os.environ.get("GITHUB_TOKEN", "")
+              repo  = os.environ.get("GITHUB_REPOSITORY", "")
+              ref   = os.environ.get("GITHUB_SHA", "")
+
+              if token and repo:
+                  url = f"https://api.github.com/repos/{repo}/code-scanning/alerts?state=open&per_page=100"
+                  req = urllib.request.Request(url)
+                  req.add_header("Authorization", f"token {token}")
+                  req.add_header("Accept", "application/vnd.github.v3+json")
+
+                  with urllib.request.urlopen(req) as response:
+                      alerts = json.loads(response.read())
+
+                  # Filter CodeQL alerts only
+                  codeql_alerts = [
+                      a for a in alerts
+                      if a.get("tool", {}).get("name", "").lower() == "codeql"
+                  ]
+                  codeql_critical = [
+                      a for a in codeql_alerts
+                      if a.get("rule", {}).get("severity", "").lower() == "critical"
+                  ]
+                  codeql_high = [
+                      a for a in codeql_alerts
+                      if a.get("rule", {}).get("severity", "").lower() == "high"
+                  ]
+                  codeql_medium = [
+                      a for a in codeql_alerts
+                      if a.get("rule", {}).get("severity", "").lower() == "medium"
+                  ]
+
+                  print(f"  Critical : {len(codeql_critical)}")
+                  print(f"  High     : {len(codeql_high)}")
+                  print(f"  Medium   : {len(codeql_medium)}")
+
+                  if len(codeql_critical) > 0:
+                      failures.append(
+                          f"SAST CodeQL: {len(codeql_critical)} CRITICAL findings "
+                          f"(threshold: 0)"
+                      )
+                  if len(codeql_high) > 0:
+                      failures.append(
+                          f"SAST CodeQL: {len(codeql_high)} HIGH findings "
+                          f"(threshold: 0)"
+                      )
+              else:
+                  warnings.append("SAST CodeQL: GITHUB_TOKEN not available for API query")
+
+          except Exception as e:
+              warnings.append(f"SAST CodeQL: could not query API — {str(e)}")
 
           # ──────────────────────────────
           # GATE 3: Gitleaks Secrets
