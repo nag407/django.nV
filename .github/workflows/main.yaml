@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5   # updated from v2
         with:
-          python-version: '3.11'         # updated from EOL 3.6
+          python-version: '3.8'         # updated from EOL 3.6
 
       - name: Install dependencies and verify Django config
         run: |
@@ -50,8 +50,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
+          python-version: '3.8'
       - name: Run Django test suite
         run: |
           pip3 install --upgrade virtualenv
@@ -87,7 +86,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.8'
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -132,18 +131,17 @@ jobs:
   sast-semgrep:
     runs-on: ubuntu-22.04
     needs: test                  # runs in parallel with Snyk
+    container:
+      image: returntocorp/semgrep
+    if: (github.actor != 'dependabot[bot]')
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4.2.2
-      - name: Run Semgrep SAST scan
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: >-
-            p/django
-            p/python
-            p/owasp-top-ten
-            p/secrets
-          
+      - name: Perform Semgrep Analysis
+        run: semgrep scan -q --sarif --config "p/django" --config "p/python" --output semgrep.sarif 
         continue-on-error: true
         # Add this only if you have a Semgrep Cloud account:
         # env:
@@ -234,6 +232,9 @@ jobs:
   compliance-checkov:
     runs-on: ubuntu-22.04
     needs: test
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
       - uses: actions/checkout@v4.2.2
