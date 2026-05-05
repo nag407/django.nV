@@ -491,7 +491,7 @@ jobs:
   # ────────────────────────────────
   compliance-checkov:
     runs-on: ubuntu-22.04
-    needs: dast-zap               # only runs if DAST gate passes
+    needs: secret-scanning               # only runs if DAST gate passes
 
     steps:
       - uses: actions/checkout@v4.2.2
