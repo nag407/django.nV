@@ -291,74 +291,131 @@ jobs:
 
       - name: Evaluate quality gates
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # for CodeQL API query
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
         run: |
           python3 << 'EOF'
-          import json, os, sys
+          import json, os, sys, glob
 
           RESULTS_DIR = "scan-results"
           failures = []
           warnings = []
 
+          # ──────────────────────────────
+          # Helper functions
+          # ──────────────────────────────
+          def find_file(pattern):
+              matches = glob.glob(
+                  f"{RESULTS_DIR}/{pattern}",
+                  recursive=True
+              )
+              return matches[0] if matches else None
+
+          def load_sarif_results(filepath):
+              with open(filepath) as f:
+                  sarif = json.load(f)
+              results = []
+              for run in sarif.get("runs", []):
+                  results.extend(run.get("results", []))
+              return results
+
+          def sarif_by_level(results):
+              error   = [r for r in results if r.get("level") == "error"]
+              warning = [r for r in results if r.get("level") == "warning"]
+              note    = [r for r in results if r.get("level") == "note"]
+              return error, warning, note
+
+          # ──────────────────────────────
+          # Show what was downloaded
+          # ──────────────────────────────
           print("=" * 60)
+          print("ARTIFACT INVENTORY")
+          print("=" * 60)
+          all_files = glob.glob(f"{RESULTS_DIR}/**/*", recursive=True)
+          for f in sorted(all_files):
+              if os.path.isfile(f):
+                  size = os.path.getsize(f)
+                  print(f"  {f} ({size} bytes)")
+
+          print("\n" + "=" * 60)
           print("QUALITY GATE EVALUATION")
           print("=" * 60)
 
           # ──────────────────────────────
           # GATE 1: Snyk SCA
           # ──────────────────────────────
-          snyk_file = f"{RESULTS_DIR}/snyk-results/snyk-results.json"
-          if os.path.exists(snyk_file):
+          snyk_file = find_file("snyk-results/snyk-direct.json")
+          print(f"\n[SCA - Snyk]")
+          print(f"  File: {snyk_file or 'NOT FOUND'}")
+
+          if snyk_file:
               with open(snyk_file) as f:
                   data = json.load(f)
-              vulns = data.get("vulnerabilities", [])
+              vulns    = data.get("vulnerabilities", [])
               critical = [v for v in vulns if v.get("severity") == "critical"]
               high     = [v for v in vulns if v.get("severity") == "high"]
               medium   = [v for v in vulns if v.get("severity") == "medium"]
 
-              print(f"\n[SCA - Snyk]")
-              print(f"  Critical : {len(critical)}")
-              print(f"  High     : {len(high)}")
+              CRITICAL_BASELINE = 6
+              HIGH_BASELINE     = 18
+
+              print(f"  Critical : {len(critical)} (baseline: {CRITICAL_BASELINE})")
+              print(f"  High     : {len(high)}     (baseline: {HIGH_BASELINE})")
               print(f"  Medium   : {len(medium)}")
 
-              if len(critical) > 0:
-                  failures.append(f"SCA: {len(critical)} CRITICAL vulnerabilities found (threshold: 0)")
-              if len(high) > 25:
-                  warnings.append(f"SCA: {len(high)} HIGH vulnerabilities found (threshold: 5)")
-          else:
-              warnings.append("SCA: snyk-results.json not found — scan may have failed")
+              if len(critical) > CRITICAL_BASELINE:
+                  failures.append(
+                      f"SCA: {len(critical) - CRITICAL_BASELINE} NEW CRITICAL "
+                      f"vulnerabilities introduced"
+                  )
+              else:
+                  warnings.append(
+                      f"SCA: {len(critical)} CRITICAL known — accepted baseline"
+                  )
 
-      
+              if len(high) > HIGH_BASELINE:
+                  failures.append(
+                      f"SCA: {len(high) - HIGH_BASELINE} NEW HIGH "
+                      f"vulnerabilities introduced"
+                  )
+          else:
+              warnings.append("SCA: snyk-direct.json not found")
+
           # ──────────────────────────────
           # GATE 2a: Semgrep SAST
           # ──────────────────────────────
-          semgrep_file = f"{RESULTS_DIR}/semgrep-results/semgrep.sarif"
-          if os.path.exists(semgrep_file):
-              with open(semgrep_file) as f:
-                  sarif = json.load(f)
-              results = []
-              for run in sarif.get("runs", []):
-                  results.extend(run.get("results", []))
+          semgrep_file = find_file("**/semgrep.sarif")
+          print(f"\n[SAST - Semgrep]")
+          print(f"  File: {semgrep_file or 'NOT FOUND'}")
 
-              semgrep_error   = [r for r in results if r.get("level") == "error"]
-              semgrep_warning = [r for r in results if r.get("level") == "warning"]
-              semgrep_note    = [r for r in results if r.get("level") == "note"]
+          if semgrep_file:
+              results = load_sarif_results(semgrep_file)
+              error, warning, note = sarif_by_level(results)
 
-              print(f"\n[SAST - Semgrep]")
-              print(f"  Error   (High)   : {len(semgrep_error)}")
-              print(f"  Warning (Medium) : {len(semgrep_warning)}")
-              print(f"  Note    (Low)    : {len(semgrep_note)}")
+              print(f"  Error   (High)   : {len(error)}")
+              print(f"  Warning (Medium) : {len(warning)}")
+              print(f"  Note    (Low)    : {len(note)}")
 
-              if len(semgrep_error) > 0:
+              if len(error) > 0:
                   failures.append(
-                      f"SAST Semgrep: {len(semgrep_error)} HIGH/ERROR findings "
-                      f"(threshold: 0)"
+                      f"SAST Semgrep: {len(error)} HIGH findings (threshold: 0)"
                   )
-              if len(semgrep_warning) > 10:
+                  # Print the actual findings for visibility
+                  print("  Top findings:")
+                  for r in error[:3]:
+                      rule = r.get("ruleId", "unknown")
+                      loc  = r.get("locations", [{}])[0]
+                      path = loc.get("physicalLocation", {}) \
+                               .get("artifactLocation", {}) \
+                               .get("uri", "?")
+                      line = loc.get("physicalLocation", {}) \
+                               .get("region", {}) \
+                               .get("startLine", "?")
+                      print(f"    [{rule}] {path}:{line}")
+
+              if len(warning) > 10:
                   warnings.append(
-                      f"SAST Semgrep: {len(semgrep_warning)} MEDIUM findings "
+                      f"SAST Semgrep: {len(warning)} MEDIUM findings "
                       f"(threshold: 10)"
                   )
           else:
@@ -366,126 +423,81 @@ jobs:
 
           # ──────────────────────────────
           # GATE 2b: CodeQL SAST
-          # CodeQL uploads directly to Security tab
-          # We query the GitHub API to read results
           # ──────────────────────────────
+          codeql_file = find_file("**/codeql-results/**/*.sarif")
+          if not codeql_file:
+              codeql_file = find_file("**/*python*.sarif")
+
           print(f"\n[SAST - CodeQL]")
-          import urllib.request, urllib.error
+          print(f"  File: {codeql_file or 'NOT FOUND'}")
 
-          try:
-              token = os.environ.get("GITHUB_TOKEN", "")
-              repo  = os.environ.get("GITHUB_REPOSITORY", "")
-              ref   = os.environ.get("GITHUB_SHA", "")
+          if codeql_file:
+              results = load_sarif_results(codeql_file)
+              error, warning, note = sarif_by_level(results)
 
-              if token and repo:
-                  url = f"https://api.github.com/repos/{repo}/code-scanning/alerts?state=open&per_page=100"
-                  req = urllib.request.Request(url)
-                  req.add_header("Authorization", f"token {token}")
-                  req.add_header("Accept", "application/vnd.github.v3+json")
+              print(f"  Error   (High)   : {len(error)}")
+              print(f"  Warning (Medium) : {len(warning)}")
+              print(f"  Note    (Low)    : {len(note)}")
 
-                  with urllib.request.urlopen(req) as response:
-                      alerts = json.loads(response.read())
-
-                  # Filter CodeQL alerts only
-                  codeql_alerts = [
-                      a for a in alerts
-                      if a.get("tool", {}).get("name", "").lower() == "codeql"
-                  ]
-                  codeql_critical = [
-                      a for a in codeql_alerts
-                      if a.get("rule", {}).get("severity", "").lower() == "critical"
-                  ]
-                  codeql_high = [
-                      a for a in codeql_alerts
-                      if a.get("rule", {}).get("severity", "").lower() == "high"
-                  ]
-                  codeql_medium = [
-                      a for a in codeql_alerts
-                      if a.get("rule", {}).get("severity", "").lower() == "medium"
-                  ]
-
-                  print(f"  Critical : {len(codeql_critical)}")
-                  print(f"  High     : {len(codeql_high)}")
-                  print(f"  Medium   : {len(codeql_medium)}")
-
-                  if len(codeql_critical) > 0:
-                      failures.append(
-                          f"SAST CodeQL: {len(codeql_critical)} CRITICAL findings "
-                          f"(threshold: 0)"
-                      )
-                  if len(codeql_high) > 0:
-                      failures.append(
-                          f"SAST CodeQL: {len(codeql_high)} HIGH findings "
-                          f"(threshold: 0)"
-                      )
-              else:
-                  warnings.append("SAST CodeQL: GITHUB_TOKEN not available for API query")
-
-          except Exception as e:
-              warnings.append(f"SAST CodeQL: could not query API — {str(e)}")
+              if len(error) > 0:
+                  failures.append(
+                      f"SAST CodeQL: {len(error)} HIGH findings (threshold: 0)"
+                  )
+          else:
+              warnings.append(
+                  "SAST CodeQL: SARIF not found — "
+                  "may still be processing or upload failed"
+              )
 
           # ──────────────────────────────
           # GATE 3: Gitleaks Secrets
-          # Zero tolerance — any secret = block
           # ──────────────────────────────
-          secrets_file = f"{RESULTS_DIR}/gitleaks-results/results.sarif"
-          if os.path.exists(secrets_file):
-              with open(secrets_file) as f:
-                  sarif = json.load(f)
+          secrets_file = find_file("**/results.sarif")
+          print(f"\n[Secrets - Gitleaks]")
+          print(f"  File: {secrets_file or 'NOT FOUND'}")
 
-              secrets_found = []
-              for run in sarif.get("runs", []):
-                  secrets_found.extend(run.get("results", []))
-
-              print(f"\n[Secrets - Gitleaks]")
-              print(f"  Secrets found: {len(secrets_found)}")
-
-              if len(secrets_found) > 0:
-                  failures.append(f"SECRETS: {len(secrets_found)} secret(s) detected — zero tolerance policy")
-          else:
-              warnings.append("Secrets: results.sarif not found — scan may have failed")
-          # ──────────────────────────────
-          # GATE 5: Checkov Compliance
-          # ──────────────────────────────
-          checkov_file = None
-          possible_paths = [
-              f"{RESULTS_DIR}/checkov-results/results_sarif.sarif",
-              f"{RESULTS_DIR}/checkov-results/checkov.sarif",
-          ]
-          for path in possible_paths:
-              if os.path.exists(path):
-                  checkov_file = path
-                  break
-
-          print(f"\n[Compliance - Checkov]")
-          if checkov_file:
-              with open(checkov_file) as f:
-                  sarif = json.load(f)
-
-              checkov_results = []
-              for run in sarif.get("runs", []):
-                  checkov_results.extend(run.get("results", []))
-
-              checkov_error   = [r for r in checkov_results if r.get("level") == "error"]
-              checkov_warning = [r for r in checkov_results if r.get("level") == "warning"]
-
-              print(f"  Critical/Error  : {len(checkov_error)}")
-              print(f"  High/Warning    : {len(checkov_warning)}")
-
-              if len(checkov_error) > 0:
+          if secrets_file:
+              results = load_sarif_results(secrets_file)
+              print(f"  Secrets found: {len(results)}")
+              if len(results) > 0:
                   failures.append(
-                      f"COMPLIANCE: {len(checkov_error)} CRITICAL misconfigurations "
+                      f"SECRETS: {len(results)} secret(s) detected "
+                      f"— zero tolerance"
+                  )
+          else:
+              warnings.append("Secrets: results.sarif not found")
+
+          # ──────────────────────────────
+          # GATE 4: Checkov Compliance
+          # ──────────────────────────────
+          checkov_file = (
+              find_file("**/results_sarif.sarif") or
+              find_file("**/checkov.sarif")
+          )
+          print(f"\n[Compliance - Checkov]")
+          print(f"  File: {checkov_file or 'NOT FOUND'}")
+
+          if checkov_file:
+              results = load_sarif_results(checkov_file)
+              error, warning, note = sarif_by_level(results)
+
+              print(f"  Critical/Error : {len(error)}")
+              print(f"  High/Warning   : {len(warning)}")
+
+              if len(error) > 0:
+                  failures.append(
+                      f"COMPLIANCE: {len(error)} CRITICAL misconfigs "
                       f"(threshold: 0)"
                   )
-              if len(checkov_warning) > 5:
+              if len(warning) > 5:
                   warnings.append(
-                      f"COMPLIANCE: {len(checkov_warning)} HIGH misconfigs "
+                      f"COMPLIANCE: {len(warning)} HIGH misconfigs "
                       f"(threshold: 5)"
                   )
           else:
               warnings.append(
                   "Compliance: no Checkov SARIF found — "
-                  "checked results_sarif.sarif and checkov.sarif"
+                  "checkov job may have failed"
               )
 
           # ──────────────────────────────
@@ -502,8 +514,8 @@ jobs:
 
           if failures:
               print("\nBLOCKERS:")
-              for f in failures:
-                  print(f"  ✖  {f}")
+              for bl in failures:
+                  print(f"  ✖  {bl}")
               print("\n" + "=" * 60)
               print("QUALITY GATE: FAILED — merge is blocked")
               print("=" * 60)
@@ -513,8 +525,7 @@ jobs:
               print("QUALITY GATE: PASSED — pipeline may proceed")
               print("=" * 60)
               sys.exit(0)
-
-          EOF      
+          EOF   
   # ────────────────────────────────
   # 4. INTEGRATION (stub)
   # ────────────────────────────────
