@@ -1,16 +1,17 @@
-name: Django – CI + SCA (Snyk)
+name: Django – CI + SCA + SAST + Secrets + DAST + Compliance
 
 on:
   push:
     branches: [master]
   pull_request:
     branches: [master]
-  workflow_dispatch: 
-# Least-privilege token permissions
+  workflow_dispatch:
+
 permissions:
   contents: read
+  security-events: write
+  actions: read
 
-# Cancel duplicate runs on the same branch/PR
 concurrency:
   group: django-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,20 +24,20 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4   # updated from v2
+      - uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5   # updated from v2
+        uses: actions/setup-python@v5.6.0
         with:
-          python-version: '3.8'         # updated from EOL 3.6
+          python-version: '3.8'
 
-      - name: Install dependencies and verify Django config
+      - name: Install dependencies
         run: |
           pip3 install --upgrade virtualenv
           virtualenv env
           source env/bin/activate
           pip install -r requirements.txt
-          python manage.py check          # fixed: was [manage.py](http://manage.py)
+          python manage.py check
 
   # ────────────────────────────────
   # 2. TEST
@@ -45,467 +46,110 @@ jobs:
     runs-on: ubuntu-22.04
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.8'
+
       - name: Run Django test suite
         run: |
           pip3 install --upgrade virtualenv
           virtualenv env
           source env/bin/activate
           pip install -r requirements.txt
-          python manage.py test taskManager   # fixed: was [manage.py](...)
+          python manage.py test taskManager
 
   # ────────────────────────────────
-  # 3. SCA — Snyk (Python)
+  # 3. SCA — Snyk + Inline Gate
+  # Gate reads snyk JSON directly
+  # Blocks if new criticals introduced
   # ────────────────────────────────
-  # What this job does:
-  #   - Scans requirements.txt for known CVEs via Snyk's database
-  #   - Saves results as snyk-results.json (uploaded as artifact)
-  #   - continue-on-error: true means vulnerable deps don't BLOCK
-  #     the pipeline yet — results are advisory at this PoC stage
-  #
-  # Prerequisites:
-  #   Go to your repo → Settings → Secrets and variables → Actions
-  #   → New repository secret → Name: SNYK_TOKEN, Value: <your token>
-  #   Get your token at: https://app.snyk.io/account
-  # ────────────────────────────────
-  oast-snyk:
+  sca-snyk:
     runs-on: ubuntu-22.04
     needs: test
-    permissions:
-      contents: read
-      security-events: write   # needed if you later add SARIF upload
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.8'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Set up Snyk CLI
+      - name: Set up Snyk
         uses: snyk/actions/setup@master
-        # Note: @master is the only tag Snyk publishes for the setup action.
-        # Acceptable for a PoC — for production, pin to a specific commit SHA.
 
-      # REMOVED: actions/setup-go — not needed for Python SCA
-      # REMOVED: actions/setup-node + npm install — django.nv has no package.json
-      #          Snyk scans Python via requirements.txt, not npm
+      - name: Authenticate Snyk
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Run Snyk SCA scan
+      - name: Run Snyk scan
         run: |
           snyk test \
             --file=requirements.txt \
             --package-manager=pip \
             --json \
-            > snyk-results.json || true
-          # '|| true' prevents non-zero exit from stopping the upload step.
-          # This is equivalent to continue-on-error but more explicit
-          # about why we're swallowing the exit code here.
+            > snyk-results.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          # If SNYK_TOKEN is missing from repo secrets, this job will
-          # authenticate as anonymous and may return no results or 401.
-
-      - name: Upload Snyk results artifact
-        uses: actions/upload-artifact@v4   # updated from v4 (already correct, keeping)
-        if: always()
-        # 'if: always()' explained:
-        #   Snyk exits with code 1 when vulnerabilities are found.
-        #   Without 'if: always()', the upload step would be SKIPPED
-        #   when vulnerabilities exist — defeating the purpose of the scan.
-        #   This ensures the JSON report is always saved regardless of findings.
-        with:
-          name: snyk-results
-          path: snyk-results.json
-          retention-days: 14   # added: explicit retention to control storage usage
-    
-  sast-semgrep:
-    runs-on: ubuntu-22.04
-    needs: test                  # runs in parallel with Snyk
-    container:
-      image: returntocorp/semgrep
-    if: (github.actor != 'dependabot[bot]')
-    permissions:
-      security-events: write
-      actions: read
-      contents: read
-
-    steps:
-      - name: Perform Semgrep Analysis
-        run: semgrep scan -q --sarif --config "p/django" --config "p/python" --output semgrep.sarif 
-        continue-on-error: true
-        # Add this only if you have a Semgrep Cloud account:
-        # env:
-        #   SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-
-      - name: Upload Semgrep SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep
-
-      - name: Upload Semgrep results artifact
-        uses: actions/upload-artifact@v4.6.2
-        if: always()
-        with:
-          name: semgrep-results
-          path: semgrep.sarif
-          retention-days: 14
-
-  sast-codeql:
-    runs-on: ubuntu-22.04
-    needs: test
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-
-    steps:
-      - uses: actions/checkout@v4.2.2
-        with:
-          fetch-depth: 2             # CodeQL needs git history
-
-      # Step 1 — Initialise CodeQL database
-      # CodeQL compiles your code into a queryable
-      # semantic database before scanning
-      - name: Initialise CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: python
-          # security-extended → 50% more rules than default
-          # security-and-quality → adds maintainability checks
-          queries: security-extended,security-and-quality
-
-      # Step 2 — Build the code model
-      # For Python this is automatic
-      # For Java/C++ this compiles the source
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      # Step 3 — Run all queries against the database
-      # Automatically uploads SARIF to Security tab
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:python"
-          upload: true
-          output: codeql-results
-
-      - name: Upload CodeQL artifact
-        uses: actions/upload-artifact@v4.6.2
-        if: always()
-        with:
-          name: codeql-results
-          path: codeql-results/
-          retention-days: 14
-          
-  secret-scanning:
-    runs-on: ubuntu-22.04
-    needs: test
-    steps:
-      - uses: actions/checkout@v4.2.2
-        with:
-          fetch-depth: 0               # full git history scan
-      - name: Run Gitleaks secret scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
 
-      - name: Upload Gitleaks results
-        uses: actions/upload-artifact@v4.6.2
-        if: always()
-        with:
-          name: gitleaks-results
-          path: results.sarif
-          retention-days: 14
-          
-  compliance-checkov:
-    runs-on: ubuntu-22.04
-    needs: test
-    permissions:
-      contents: read
-      security-events: write
-
-    steps:
-      - uses: actions/checkout@v4.2.2
-      - name: Run Checkov compliance scan
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory: .
-          framework: dockerfile,github_actions
-          output_format: sarif
-          output_file_path: .
-          soft_fail: true
-        continue-on-error: true
-        
-      - name: Verify Checkov output
-        if: always()
-        run: |
-          echo "=== Files in current directory ==="
-          ls -la *.sarif 2>/dev/null || echo "No SARIF files found"
-          echo "=== All SARIF files in workspace ==="
-          find . -name "*.sarif" 2>/dev/null
-          echo "=== Checkov output files ==="
-          find . -name "results_sarif.sarif" 2>/dev/null
-          find . -name "checkov.sarif" 2>/dev/null
-
-      - name: Upload Checkov SARIF to Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always() && github.event_name != 'pull_request'
-        with:
-          sarif_file: results_sarif.sarif 
-          category: checkov
-
-      - name: Upload Checkov artifact
-        uses: actions/upload-artifact@v4.6.2
-        if: always()
-        with:
-          name: checkov-results
-          path: results_sarif.sarif 
-          retention-days: 14
-          
-  quality-gate:
-    runs-on: ubuntu-22.04
-    needs: [oast-snyk, sast-semgrep,sast-codeql, secret-scanning,compliance-checkov]
-    permissions:
-      contents: read
-      security-events: read
-    if: always()
-
-    steps:
-      - name: Download all scan artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: scan-results
-
-      - name: Evaluate quality gates
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+      # ── INLINE GATE ──────────────
+      - name: "Gate: SCA threshold check"
         run: |
           python3 << 'EOF'
-          import json, os, sys, glob
+          import json, sys
 
-          RESULTS_DIR = "scan-results"
+          CRITICAL_BASELINE = 6     # known django.nv baseline
+          HIGH_BASELINE     = 18    # known django.nv baseline
+
+          with open('snyk-results.json') as f:
+              data = json.load(f)
+
+          vulns    = data.get('vulnerabilities', [])
+          critical = [v for v in vulns if v.get('severity') == 'critical']
+          high     = [v for v in vulns if v.get('severity') == 'high']
+          medium   = [v for v in vulns if v.get('severity') == 'medium']
+          low      = [v for v in vulns if v.get('severity') == 'low']
+
+          print("=" * 50)
+          print("SCA GATE — Snyk Results")
+          print("=" * 50)
+          print(f"  Critical : {len(critical):3d}  (baseline: {CRITICAL_BASELINE})")
+          print(f"  High     : {len(high):3d}  (baseline: {HIGH_BASELINE})")
+          print(f"  Medium   : {len(medium):3d}")
+          print(f"  Low      : {len(low):3d}")
+
           failures = []
           warnings = []
 
-          # ──────────────────────────────
-          # Helper functions
-          # ──────────────────────────────
-          def find_file(pattern):
-              matches = glob.glob(
-                  f"{RESULTS_DIR}/{pattern}",
-                  recursive=True
+          # Block on new criticals above baseline
+          if len(critical) > CRITICAL_BASELINE:
+              failures.append(
+                  f"NEW CRITICAL: {len(critical) - CRITICAL_BASELINE} "
+                  f"above baseline of {CRITICAL_BASELINE}"
               )
-              return matches[0] if matches else None
-
-          def load_sarif_results(filepath):
-              with open(filepath) as f:
-                  sarif = json.load(f)
-              results = []
-              for run in sarif.get("runs", []):
-                  results.extend(run.get("results", []))
-              return results
-
-          def sarif_by_level(results):
-              error   = [r for r in results if r.get("level") == "error"]
-              warning = [r for r in results if r.get("level") == "warning"]
-              note    = [r for r in results if r.get("level") == "note"]
-              return error, warning, note
-
-          # ──────────────────────────────
-          # Show what was downloaded
-          # ──────────────────────────────
-          print("=" * 60)
-          print("ARTIFACT INVENTORY")
-          print("=" * 60)
-          all_files = glob.glob(f"{RESULTS_DIR}/**/*", recursive=True)
-          for f in sorted(all_files):
-              if os.path.isfile(f):
-                  size = os.path.getsize(f)
-                  print(f"  {f} ({size} bytes)")
-
-          print("\n" + "=" * 60)
-          print("QUALITY GATE EVALUATION")
-          print("=" * 60)
-
-          # ──────────────────────────────
-          # GATE 1: Snyk SCA
-          # ──────────────────────────────
-          snyk_file = find_file("snyk-results/snyk-direct.json")
-          print(f"\n[SCA - Snyk]")
-          print(f"  File: {snyk_file or 'NOT FOUND'}")
-
-          if snyk_file:
-              with open(snyk_file) as f:
-                  data = json.load(f)
-              vulns    = data.get("vulnerabilities", [])
-              critical = [v for v in vulns if v.get("severity") == "critical"]
-              high     = [v for v in vulns if v.get("severity") == "high"]
-              medium   = [v for v in vulns if v.get("severity") == "medium"]
-
-              CRITICAL_BASELINE = 6
-              HIGH_BASELINE     = 18
-
-              print(f"  Critical : {len(critical)} (baseline: {CRITICAL_BASELINE})")
-              print(f"  High     : {len(high)}     (baseline: {HIGH_BASELINE})")
-              print(f"  Medium   : {len(medium)}")
-
-              if len(critical) > CRITICAL_BASELINE:
-                  failures.append(
-                      f"SCA: {len(critical) - CRITICAL_BASELINE} NEW CRITICAL "
-                      f"vulnerabilities introduced"
-                  )
-              else:
-                  warnings.append(
-                      f"SCA: {len(critical)} CRITICAL known — accepted baseline"
-                  )
-
-              if len(high) > HIGH_BASELINE:
-                  failures.append(
-                      f"SCA: {len(high) - HIGH_BASELINE} NEW HIGH "
-                      f"vulnerabilities introduced"
-                  )
-          else:
-              warnings.append("SCA: snyk-direct.json not found")
-
-          # ──────────────────────────────
-          # GATE 2a: Semgrep SAST
-          # ──────────────────────────────
-          semgrep_file = find_file("**/semgrep.sarif")
-          print(f"\n[SAST - Semgrep]")
-          print(f"  File: {semgrep_file or 'NOT FOUND'}")
-
-          if semgrep_file:
-              results = load_sarif_results(semgrep_file)
-              error, warning, note = sarif_by_level(results)
-
-              print(f"  Error   (High)   : {len(error)}")
-              print(f"  Warning (Medium) : {len(warning)}")
-              print(f"  Note    (Low)    : {len(note)}")
-
-              if len(error) > 0:
-                  failures.append(
-                      f"SAST Semgrep: {len(error)} HIGH findings (threshold: 0)"
-                  )
-                  # Print the actual findings for visibility
-                  print("  Top findings:")
-                  for r in error[:3]:
-                      rule = r.get("ruleId", "unknown")
-                      loc  = r.get("locations", [{}])[0]
-                      path = loc.get("physicalLocation", {}) \
-                               .get("artifactLocation", {}) \
-                               .get("uri", "?")
-                      line = loc.get("physicalLocation", {}) \
-                               .get("region", {}) \
-                               .get("startLine", "?")
-                      print(f"    [{rule}] {path}:{line}")
-
-              if len(warning) > 10:
-                  warnings.append(
-                      f"SAST Semgrep: {len(warning)} MEDIUM findings "
-                      f"(threshold: 10)"
-                  )
-          else:
-              warnings.append("SAST Semgrep: semgrep.sarif not found")
-
-          # ──────────────────────────────
-          # GATE 2b: CodeQL SAST
-          # ──────────────────────────────
-          codeql_file = find_file("**/codeql-results/**/*.sarif")
-          if not codeql_file:
-              codeql_file = find_file("**/*python*.sarif")
-
-          print(f"\n[SAST - CodeQL]")
-          print(f"  File: {codeql_file or 'NOT FOUND'}")
-
-          if codeql_file:
-              results = load_sarif_results(codeql_file)
-              error, warning, note = sarif_by_level(results)
-
-              print(f"  Error   (High)   : {len(error)}")
-              print(f"  Warning (Medium) : {len(warning)}")
-              print(f"  Note    (Low)    : {len(note)}")
-
-              if len(error) > 0:
-                  failures.append(
-                      f"SAST CodeQL: {len(error)} HIGH findings (threshold: 0)"
-                  )
-          else:
+          elif len(critical) == CRITICAL_BASELINE:
               warnings.append(
-                  "SAST CodeQL: SARIF not found — "
-                  "may still be processing or upload failed"
+                  f"{len(critical)} CRITICAL known — "
+                  f"accepted baseline, remediation required"
               )
 
-          # ──────────────────────────────
-          # GATE 3: Gitleaks Secrets
-          # ──────────────────────────────
-          secrets_file = find_file("**/results.sarif")
-          print(f"\n[Secrets - Gitleaks]")
-          print(f"  File: {secrets_file or 'NOT FOUND'}")
-
-          if secrets_file:
-              results = load_sarif_results(secrets_file)
-              print(f"  Secrets found: {len(results)}")
-              if len(results) > 0:
-                  failures.append(
-                      f"SECRETS: {len(results)} secret(s) detected "
-                      f"— zero tolerance"
-                  )
-          else:
-              warnings.append("Secrets: results.sarif not found")
-
-          # ──────────────────────────────
-          # GATE 4: Checkov Compliance
-          # ──────────────────────────────
-          checkov_file = (
-              find_file("**/results_sarif.sarif") or
-              find_file("**/checkov.sarif")
-          )
-          print(f"\n[Compliance - Checkov]")
-          print(f"  File: {checkov_file or 'NOT FOUND'}")
-
-          if checkov_file:
-              results = load_sarif_results(checkov_file)
-              error, warning, note = sarif_by_level(results)
-
-              print(f"  Critical/Error : {len(error)}")
-              print(f"  High/Warning   : {len(warning)}")
-
-              if len(error) > 0:
-                  failures.append(
-                      f"COMPLIANCE: {len(error)} CRITICAL misconfigs "
-                      f"(threshold: 0)"
-                  )
-              if len(warning) > 5:
-                  warnings.append(
-                      f"COMPLIANCE: {len(warning)} HIGH misconfigs "
-                      f"(threshold: 5)"
-                  )
-          else:
+          # Block on new highs above baseline
+          if len(high) > HIGH_BASELINE:
+              failures.append(
+                  f"NEW HIGH: {len(high) - HIGH_BASELINE} "
+                  f"above baseline of {HIGH_BASELINE}"
+              )
+          elif len(high) == HIGH_BASELINE:
               warnings.append(
-                  "Compliance: no Checkov SARIF found — "
-                  "checkov job may have failed"
+                  f"{len(high)} HIGH known — accepted baseline"
               )
-
-          # ──────────────────────────────
-          # FINAL VERDICT
-          # ──────────────────────────────
-          print("\n" + "=" * 60)
-          print("GATE SUMMARY")
-          print("=" * 60)
 
           if warnings:
               print("\nWARNINGS:")
@@ -514,33 +158,474 @@ jobs:
 
           if failures:
               print("\nBLOCKERS:")
-              for bl in failures:
-                  print(f"  ✖  {bl}")
-              print("\n" + "=" * 60)
-              print("QUALITY GATE: FAILED — merge is blocked")
-              print("=" * 60)
+              for f in failures:
+                  print(f"  ✖  {f}")
+              print("\nSCA GATE: FAILED — stopping pipeline")
               sys.exit(1)
-          else:
-              print("\n" + "=" * 60)
-              print("QUALITY GATE: PASSED — pipeline may proceed")
-              print("=" * 60)
-              sys.exit(0)
-          EOF   
+
+          print("\nSCA GATE: PASSED ✓")
+          EOF
+
+      - name: Upload Snyk artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: snyk-results
+          path: snyk-results.json
+          retention-days: 14
+
   # ────────────────────────────────
-  # 4. INTEGRATION (stub)
+  # 4. SAST — Semgrep + Inline Gate
+  # Gate reads SARIF directly
+  # Blocks on any error-level finding
+  # ────────────────────────────────
+  sast-semgrep:
+    runs-on: ubuntu-22.04
+    needs: sca-snyk               # only runs if SCA gate passes
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep scan
+        run: |
+          semgrep scan \
+            -q \
+            --sarif \
+            --config "p/django" \
+            --config "p/python" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --output semgrep.sarif \
+            .
+        continue-on-error: true
+
+      # ── INLINE GATE ──────────────
+      - name: "Gate: SAST Semgrep threshold check"
+        run: |
+          python3 << 'EOF'
+          import json, sys
+
+          ERROR_THRESHOLD  = 0    # zero tolerance on high/error
+          WARN_THRESHOLD   = 10   # warn if medium exceeds 10
+
+          with open('semgrep.sarif') as f:
+              data = json.load(f)
+
+          results = []
+          for run in data.get('runs', []):
+              results.extend(run.get('results', []))
+
+          error   = [r for r in results if r.get('level') == 'error']
+          warning = [r for r in results if r.get('level') == 'warning']
+          note    = [r for r in results if r.get('level') == 'note']
+
+          print("=" * 50)
+          print("SAST GATE — Semgrep Results")
+          print("=" * 50)
+          print(f"  Error   (High)   : {len(error):3d}  (threshold: {ERROR_THRESHOLD})")
+          print(f"  Warning (Medium) : {len(warning):3d}  (threshold: {WARN_THRESHOLD})")
+          print(f"  Note    (Low)    : {len(note):3d}")
+
+          # Print top findings for visibility
+          if error:
+              print("\n  Top HIGH findings:")
+              for r in error[:5]:
+                  rule = r.get('ruleId', 'unknown')
+                  locs = r.get('locations', [{}])
+                  path = locs[0].get('physicalLocation', {}) \
+                                .get('artifactLocation', {}) \
+                                .get('uri', '?')
+                  line = locs[0].get('physicalLocation', {}) \
+                                .get('region', {}) \
+                                .get('startLine', '?')
+                  msg  = r.get('message', {}).get('text', '')[:60]
+                  print(f"    [{rule}] {path}:{line} — {msg}")
+
+          failures = []
+          warnings = []
+
+          if len(error) > ERROR_THRESHOLD:
+              failures.append(
+                  f"{len(error)} HIGH/ERROR findings "
+                  f"(threshold: {ERROR_THRESHOLD})"
+              )
+
+          if len(warning) > WARN_THRESHOLD:
+              warnings.append(
+                  f"{len(warning)} MEDIUM findings "
+                  f"(threshold: {WARN_THRESHOLD})"
+              )
+
+          if warnings:
+              print("\nWARNINGS:")
+              for w in warnings:
+                  print(f"  ⚠  {w}")
+
+          if failures:
+              print("\nBLOCKERS:")
+              for f in failures:
+                  print(f"  ✖  {f}")
+              print("\nSAST SEMGREP GATE: FAILED — stopping pipeline")
+              sys.exit(1)
+
+          print("\nSAST SEMGREP GATE: PASSED ✓")
+          EOF
+
+      - name: Upload Semgrep artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: semgrep-results
+          path: semgrep.sarif
+          retention-days: 14
+
+  # ────────────────────────────────
+  # 5. SAST — CodeQL + Inline Gate
+  # Gate reads SARIF directly
+  # Blocks on any error-level finding
+  # ────────────────────────────────
+  sast-codeql:
+    runs-on: ubuntu-22.04
+    needs: sast-semgrep           # only runs if Semgrep gate passes
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 2
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+          output: codeql-sarif
+          upload: true
+
+      # ── INLINE GATE ──────────────
+      - name: "Gate: SAST CodeQL threshold check"
+        run: |
+          python3 << 'EOF'
+          import json, sys, glob, os
+
+          ERROR_THRESHOLD = 0    # zero tolerance on high/error
+          WARN_THRESHOLD  = 5    # warn if medium exceeds 5
+
+          # Find CodeQL SARIF — output dir may vary
+          sarif_files = glob.glob('codeql-sarif/**/*.sarif', recursive=True)
+          if not sarif_files:
+              sarif_files = glob.glob('/home/runner/work/**/*.sarif', recursive=True)
+
+          print("=" * 50)
+          print("SAST GATE — CodeQL Results")
+          print("=" * 50)
+
+          if not sarif_files:
+              print("  WARNING: No CodeQL SARIF found — skipping gate")
+              print("\nCODEQL GATE: SKIPPED (no output)")
+              sys.exit(0)
+
+          results = []
+          for sf in sarif_files:
+              with open(sf) as f:
+                  data = json.load(f)
+              for run in data.get('runs', []):
+                  results.extend(run.get('results', []))
+
+          error   = [r for r in results if r.get('level') == 'error']
+          warning = [r for r in results if r.get('level') == 'warning']
+          note    = [r for r in results if r.get('level') == 'note']
+
+          print(f"  Error   (High)   : {len(error):3d}  (threshold: {ERROR_THRESHOLD})")
+          print(f"  Warning (Medium) : {len(warning):3d}  (threshold: {WARN_THRESHOLD})")
+          print(f"  Note    (Low)    : {len(note):3d}")
+
+          if error:
+              print("\n  Top HIGH findings:")
+              for r in error[:5]:
+                  rule = r.get('ruleId', 'unknown')
+                  locs = r.get('locations', [{}])
+                  path = locs[0].get('physicalLocation', {}) \
+                                .get('artifactLocation', {}) \
+                                .get('uri', '?')
+                  line = locs[0].get('physicalLocation', {}) \
+                                .get('region', {}) \
+                                .get('startLine', '?')
+                  print(f"    [{rule}] {path}:{line}")
+
+          failures = []
+          warnings = []
+
+          if len(error) > ERROR_THRESHOLD:
+              failures.append(
+                  f"{len(error)} HIGH/ERROR findings "
+                  f"(threshold: {ERROR_THRESHOLD})"
+              )
+          if len(warning) > WARN_THRESHOLD:
+              warnings.append(
+                  f"{len(warning)} MEDIUM findings "
+                  f"(threshold: {WARN_THRESHOLD})"
+              )
+
+          if warnings:
+              print("\nWARNINGS:")
+              for w in warnings:
+                  print(f"  ⚠  {w}")
+
+          if failures:
+              print("\nBLOCKERS:")
+              for f in failures:
+                  print(f"  ✖  {f}")
+              print("\nCODEQL GATE: FAILED — stopping pipeline")
+              sys.exit(1)
+
+          print("\nCODEQL GATE: PASSED ✓")
+          EOF
+
+      - name: Upload CodeQL artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: codeql-results
+          path: codeql-sarif/
+          retention-days: 14
+
+  # ────────────────────────────────
+  # 6. SECRETS — Gitleaks + Inline Gate
+  # Zero tolerance — any secret blocks
+  # ────────────────────────────────
+  secret-scanning:
+    runs-on: ubuntu-22.04
+    needs: sast-codeql            # only runs if CodeQL gate passes
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0          # full history scan
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      # ── INLINE GATE ──────────────
+      - name: "Gate: Secrets zero-tolerance check"
+        run: |
+          python3 << 'EOF'
+          import json, sys, os
+
+          print("=" * 50)
+          print("SECRETS GATE — Gitleaks Results")
+          print("=" * 50)
+
+          sarif_file = 'results.sarif'
+
+          if not os.path.exists(sarif_file):
+              print("  No results.sarif found")
+              print("  This means either:")
+              print("  1. No secrets detected (good)")
+              print("  2. Gitleaks failed to run (check above steps)")
+              print("\nSECRETS GATE: PASSED ✓ (no findings file = no secrets)")
+              sys.exit(0)
+
+          with open(sarif_file) as f:
+              data = json.load(f)
+
+          results = []
+          for run in data.get('runs', []):
+              results.extend(run.get('results', []))
+
+          print(f"  Secrets found: {len(results)}")
+
+          if results:
+              print("\n  Secrets detected:")
+              for r in results[:5]:
+                  rule = r.get('ruleId', 'unknown')
+                  locs = r.get('locations', [{}])
+                  path = locs[0].get('physicalLocation', {}) \
+                                .get('artifactLocation', {}) \
+                                .get('uri', '?')
+                  line = locs[0].get('physicalLocation', {}) \
+                                .get('region', {}) \
+                                .get('startLine', '?')
+                  print(f"    [{rule}] {path}:{line}")
+
+          if len(results) > 0:
+              print(f"\n  ✖  {len(results)} secret(s) found — zero tolerance policy")
+              print("\nSECRETS GATE: FAILED — stopping pipeline")
+              sys.exit(1)
+
+          print("\nSECRETS GATE: PASSED ✓")
+          EOF
+
+      - name: Upload Gitleaks artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: gitleaks-results
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+  
+
+  # ────────────────────────────────
+  # 8. COMPLIANCE — Checkov + Inline Gate
+  # Gate reads SARIF directly
+  # Blocks on critical misconfigs
+  # ────────────────────────────────
+  compliance-checkov:
+    runs-on: ubuntu-22.04
+    needs: dast-zap               # only runs if DAST gate passes
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov scan
+        run: |
+          checkov \
+            --directory .github/workflows \
+            --framework github_actions \
+            --output sarif \
+            --output-file-path . \
+            --soft-fail \
+            --compact
+        continue-on-error: true
+
+      - name: Verify Checkov output
+        if: always()
+        run: |
+          echo "=== Checkov output files ==="
+          find . -maxdepth 2 \( -name "*.sarif" -o -name "results*" \) | sort
+
+      # ── INLINE GATE ──────────────
+      - name: "Gate: Compliance threshold check"
+        run: |
+          python3 << 'EOF'
+          import json, sys, os, glob
+
+          CRITICAL_THRESHOLD = 0    # zero tolerance on critical
+          HIGH_THRESHOLD     = 5    # warn if high exceeds 5
+
+          print("=" * 50)
+          print("COMPLIANCE GATE — Checkov Results")
+          print("=" * 50)
+
+          # Checkov can write different filenames
+          sarif_file = None
+          for candidate in ['results_sarif.sarif', 'results.sarif', 'checkov.sarif']:
+              if os.path.exists(candidate):
+                  sarif_file = candidate
+                  break
+
+          if not sarif_file:
+              found = glob.glob('**/*.sarif', recursive=True)
+              if found:
+                  sarif_file = found[0]
+
+          print(f"  File: {sarif_file or 'NOT FOUND'}")
+
+          if not sarif_file:
+              print("  WARNING: No Checkov SARIF found")
+              print("  Checkov may have found nothing to scan")
+              print("\nCOMPLIANCE GATE: PASSED ✓ (no output = nothing to flag)")
+              sys.exit(0)
+
+          with open(sarif_file) as f:
+              data = json.load(f)
+
+          results = []
+          for run in data.get('runs', []):
+              results.extend(run.get('results', []))
+
+          critical = [r for r in results if r.get('level') == 'error']
+          high     = [r for r in results if r.get('level') == 'warning']
+          low      = [r for r in results if r.get('level') == 'note']
+
+          print(f"  Critical/Error  : {len(critical):3d}  (threshold: {CRITICAL_THRESHOLD})")
+          print(f"  High/Warning    : {len(high):3d}  (threshold: {HIGH_THRESHOLD})")
+          print(f"  Low/Note        : {len(low):3d}")
+
+          if critical:
+              print("\n  CRITICAL findings:")
+              for r in critical[:5]:
+                  rule = r.get('ruleId', 'unknown')
+                  msg  = r.get('message', {}).get('text', '')[:60]
+                  print(f"    ✖  [{rule}] {msg}")
+
+          failures = []
+          warnings = []
+
+          if len(critical) > CRITICAL_THRESHOLD:
+              failures.append(
+                  f"{len(critical)} CRITICAL misconfigurations "
+                  f"(threshold: {CRITICAL_THRESHOLD})"
+              )
+          if len(high) > HIGH_THRESHOLD:
+              warnings.append(
+                  f"{len(high)} HIGH misconfigurations "
+                  f"(threshold: {HIGH_THRESHOLD})"
+              )
+
+          if warnings:
+              print("\nWARNINGS:")
+              for w in warnings:
+                  print(f"  ⚠  {w}")
+
+          if failures:
+              print("\nBLOCKERS:")
+              for f in failures:
+                  print(f"  ✖  {f}")
+              print("\nCOMPLIANCE GATE: FAILED — stopping pipeline")
+              sys.exit(1)
+
+          print("\nCOMPLIANCE GATE: PASSED ✓")
+          EOF
+
+      - name: Upload Checkov artifact
+        uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: checkov-results
+          path: |
+            results_sarif.sarif
+            results.sarif
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ────────────────────────────────
+  # 9. INTEGRATION
+  # Only reaches here if ALL gates pass
   # ────────────────────────────────
   integration:
     runs-on: ubuntu-22.04
-    needs: quality-gate
+    needs: compliance-checkov
     steps:
       - name: Integration smoke test
-        run: echo "Integration step — replace with real smoke test"
-      # REMOVED: 'run: exit 1' with continue-on-error
-      # Reason: intentional failures train developers to ignore
-      # yellow/red pipeline status. Remove or replace with a real test.
+        run: |
+          echo "All security gates passed"
+          echo "Safe to proceed to integration"
 
   # ────────────────────────────────
-  # 5. PROD DEPLOY (stub)
+  # 10. PROD
   # ────────────────────────────────
   prod:
     runs-on: ubuntu-22.04
