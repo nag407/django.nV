@@ -181,7 +181,7 @@ jobs:
   # ────────────────────────────────
   sast-semgrep:
     runs-on: ubuntu-22.04
-    needs: sca-snyk               # only runs if SCA gate passes
+    needs: sca-snyk
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -199,8 +199,29 @@ jobs:
             --config "p/owasp-top-ten" \
             --config "p/secrets" \
             --output semgrep.sarif \
-            .
-        continue-on-error: true
+            . || true
+
+      - name: Debug — confirm SARIF was written
+        if: always()
+        run: |
+          echo "=== Files in workspace ==="
+          ls -la *.sarif 2>/dev/null || echo "No .sarif files found"
+          echo ""
+          echo "=== SARIF result count (raw) ==="
+          python3 -c "
+          import json
+          with open('semgrep.sarif') as f:
+              data = json.load(f)
+          count = sum(len(run.get('results',[])) for run in data.get('runs',[]))
+          print(f'Total results in file: {count}')
+          for run in data.get('runs', []):
+              results = run.get('results', [])
+              levels = {}
+              for r in results:
+                  lv = r.get('level', 'none')
+                  levels[lv] = levels.get(lv, 0) + 1
+              print(f'Breakdown: {levels}')
+          "
 
       # ── INLINE GATE ──────────────
       - name: "Gate: SAST Semgrep threshold check"
@@ -208,19 +229,39 @@ jobs:
           python3 << 'EOF'
           import json, sys
 
-          ERROR_THRESHOLD  = 0    # zero tolerance on high/error
-          WARN_THRESHOLD   = 10   # warn if medium exceeds 10
+          ERROR_THRESHOLD  = 0
+          WARN_THRESHOLD   = 10
 
           with open('semgrep.sarif') as f:
               data = json.load(f)
+
+          # Semgrep SARIF: level is on the result OR on the rule default
+          # Build a lookup: ruleId -> defaultLevel
+          rule_defaults = {}
+          for run in data.get('runs', []):
+              for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                  rule_id = rule.get('id', '')
+                  default_level = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                  rule_defaults[rule_id] = default_level
 
           results = []
           for run in data.get('runs', []):
               results.extend(run.get('results', []))
 
-          error   = [r for r in results if r.get('level') == 'error']
-          warning = [r for r in results if r.get('level') == 'warning']
-          note    = [r for r in results if r.get('level') == 'note']
+          error   = []
+          warning = []
+          note    = []
+
+          for r in results:
+              rule_id = r.get('ruleId', '')
+              # Result-level overrides rule default; fall back to rule default
+              level = r.get('level') or rule_defaults.get(rule_id, 'warning')
+              if level == 'error':
+                  error.append(r)
+              elif level == 'warning':
+                  warning.append(r)
+              else:
+                  note.append(r)
 
           print("=" * 50)
           print("SAST GATE — Semgrep Results")
@@ -229,7 +270,6 @@ jobs:
           print(f"  Warning (Medium) : {len(warning):3d}  (threshold: {WARN_THRESHOLD})")
           print(f"  Note    (Low)    : {len(note):3d}")
 
-          # Print top findings for visibility
           if error:
               print("\n  Top HIGH findings:")
               for r in error[:5]:
@@ -241,8 +281,9 @@ jobs:
                   line = locs[0].get('physicalLocation', {}) \
                                 .get('region', {}) \
                                 .get('startLine', '?')
-                  msg  = r.get('message', {}).get('text', '')[:60]
-                  print(f"    [{rule}] {path}:{line} — {msg}")
+                  msg  = r.get('message', {}).get('text', '')[:80]
+                  print(f"    [{rule}] {path}:{line}")
+                  print(f"      {msg}")
 
           failures = []
           warnings = []
@@ -252,7 +293,6 @@ jobs:
                   f"{len(error)} HIGH/ERROR findings "
                   f"(threshold: {ERROR_THRESHOLD})"
               )
-
           if len(warning) > WARN_THRESHOLD:
               warnings.append(
                   f"{len(warning)} MEDIUM findings "
@@ -281,7 +321,6 @@ jobs:
           name: semgrep-results
           path: semgrep.sarif
           retention-days: 14
-
   # ────────────────────────────────
   # 5. SAST — CodeQL + Inline Gate
   # Gate reads SARIF directly
