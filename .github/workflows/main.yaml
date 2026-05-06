@@ -632,58 +632,55 @@ jobs:
             --compact
         continue-on-error: true
 
-      - name: Debug — confirm Checkov SARIF location and content
+      - name: Debug — Checkov SARIF deep inspection
         if: always()
         run: |
-          echo "=== Searching for Checkov SARIF files ==="
-          find . -maxdepth 3 -name "*.sarif" 2>/dev/null | sort
-          echo ""
-          echo "=== Checkov result count (raw) ==="
-          python3 -c "
-          import json, glob
+          python3 << 'EOF'
+          import json, os
 
-          sarif_files = []
-          for candidate in ['results_sarif.sarif', 'results.sarif', 'checkov.sarif']:
-              import os
-              if os.path.exists(candidate):
-                  sarif_files.append(candidate)
-                  break
+          sarif_file = 'results_sarif.sarif'
+          if not os.path.exists(sarif_file):
+              print("FILE NOT FOUND")
+              exit(1)
 
-          if not sarif_files:
-              sarif_files = glob.glob('**/*.sarif', recursive=True)
-              sarif_files = [f for f in sarif_files
-                             if 'semgrep' not in f and 'codeql' not in f]
+          with open(sarif_file) as f:
+              data = json.load(f)
 
-          print(f'SARIF files found: {sarif_files}')
+          for i, run in enumerate(data.get('runs', [])):
+              print(f"\n=== RUN {i} ===")
 
-          for sf in sarif_files:
-              with open(sf) as f:
-                  data = json.load(f)
+              # How many results?
+              results = run.get('results', [])
+              print(f"Total results: {len(results)}")
 
-              rule_defaults = {}
-              for run in data.get('runs', []):
-                  for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
-                      rid = rule.get('id', '')
-                      lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
-                      rule_defaults[rid] = lv
-                  for ext in run.get('tool', {}).get('extensions', []):
-                      for rule in ext.get('rules', []):
-                          rid = rule.get('id', '')
-                          lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
-                          rule_defaults[rid] = lv
+              # Driver rules
+              driver_rules = run.get('tool', {}).get('driver', {}).get('rules', [])
+              print(f"Driver rules  : {len(driver_rules)}")
 
-              results = []
-              for run in data.get('runs', []):
-                  results.extend(run.get('results', []))
+              # Extension rules
+              extensions = run.get('tool', {}).get('extensions', [])
+              print(f"Extensions    : {len(extensions)}")
+              for ext in extensions:
+                  ext_rules = ext.get('rules', [])
+                  print(f"  ext '{ext.get('name','')}' rules: {len(ext_rules)}")
 
-              levels = {}
-              for r in results:
-                  rid = r.get('ruleId', '')
-                  lv  = r.get('level') or rule_defaults.get(rid, 'warning')
-                  levels[lv] = levels.get(lv, 0) + 1
+              # Sample first 3 rules from driver — what does level look like?
+              print("\n--- Sample driver rules (first 3) ---")
+              for rule in driver_rules[:3]:
+                  print(f"  id      : {rule.get('id')}")
+                  print(f"  default : {rule.get('defaultConfiguration')}")
+                  print(f"  props   : {rule.get('properties', {}).get('tags', [])}")
+                  print()
 
-              print(f'File: {sf}  |  Total: {len(results)}  |  Breakdown: {levels}')
-          "
+              # Sample first 3 results — what does level look like?
+              print("--- Sample results (first 3) ---")
+              for r in results[:3]:
+                  print(f"  ruleId  : {r.get('ruleId')}")
+                  print(f"  level   : {r.get('level')}")         # often absent
+                  print(f"  kind    : {r.get('kind')}")           # Checkov uses 'fail'
+                  print(f"  props   : {r.get('properties')}")     # severity may be here
+                  print()
+          EOF
 
       # ── INLINE GATE ──────────────
       - name: "Gate: Compliance threshold check"
