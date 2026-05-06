@@ -355,19 +355,71 @@ jobs:
           output: codeql-sarif
           upload: true
 
+      - name: Debug — confirm CodeQL SARIF location and content
+        if: always()
+        run: |
+          echo "=== Searching for CodeQL SARIF files ==="
+          find . -name "*.sarif" 2>/dev/null | sort
+          echo ""
+          echo "=== Contents of codeql-sarif/ dir ==="
+          ls -la codeql-sarif/ 2>/dev/null || echo "codeql-sarif/ not found"
+          echo ""
+          echo "=== CodeQL result count (raw) ==="
+          python3 -c "
+          import json, glob, os
+
+          sarif_files = glob.glob('codeql-sarif/**/*.sarif', recursive=True)
+          if not sarif_files:
+              sarif_files = glob.glob('**/*.sarif', recursive=True)
+
+          print(f'SARIF files found: {sarif_files}')
+
+          for sf in sarif_files:
+              with open(sf) as f:
+                  data = json.load(f)
+
+              # Build rule-level lookup
+              rule_defaults = {}
+              for run in data.get('runs', []):
+                  for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                      rid = rule.get('id', '')
+                      lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                      rule_defaults[rid] = lv
+                  # Also check extensions (CodeQL uses tool.extensions)
+                  for ext in run.get('tool', {}).get('extensions', []):
+                      for rule in ext.get('rules', []):
+                          rid = rule.get('id', '')
+                          lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                          rule_defaults[rid] = lv
+
+              results = []
+              for run in data.get('runs', []):
+                  results.extend(run.get('results', []))
+
+              levels = {}
+              for r in results:
+                  rid = r.get('ruleId', '')
+                  lv  = r.get('level') or rule_defaults.get(rid, 'warning')
+                  levels[lv] = levels.get(lv, 0) + 1
+
+              print(f'File: {sf}  |  Total: {len(results)}  |  Breakdown: {levels}')
+          "
+
       # ── INLINE GATE ──────────────
       - name: "Gate: SAST CodeQL threshold check"
         run: |
           python3 << 'EOF'
-          import json, sys, glob, os
+          import json, sys, glob
 
-          ERROR_THRESHOLD = 0    # zero tolerance on high/error
-          WARN_THRESHOLD  = 5    # warn if medium exceeds 5
+          ERROR_THRESHOLD = 0
+          WARN_THRESHOLD  = 5
 
-          # Find CodeQL SARIF — output dir may vary
+          # Locate SARIF — CodeQL writes to codeql-sarif/ by default
           sarif_files = glob.glob('codeql-sarif/**/*.sarif', recursive=True)
           if not sarif_files:
-              sarif_files = glob.glob('/home/runner/work/**/*.sarif', recursive=True)
+              sarif_files = glob.glob('**/*.sarif', recursive=True)
+              # exclude semgrep's own file
+              sarif_files = [f for f in sarif_files if 'semgrep' not in f]
 
           print("=" * 50)
           print("SAST GATE — CodeQL Results")
@@ -378,33 +430,63 @@ jobs:
               print("\nCODEQL GATE: SKIPPED (no output)")
               sys.exit(0)
 
-          results = []
+          print(f"  File(s): {sarif_files}")
+
+          # Build rule-level lookup from ALL runs across ALL files
+          rule_defaults = {}
+          all_results   = []
+
           for sf in sarif_files:
               with open(sf) as f:
                   data = json.load(f)
-              for run in data.get('runs', []):
-                  results.extend(run.get('results', []))
 
-          error   = [r for r in results if r.get('level') == 'error']
-          warning = [r for r in results if r.get('level') == 'warning']
-          note    = [r for r in results if r.get('level') == 'note']
+              for run in data.get('runs', []):
+                  # driver rules
+                  for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                      rid = rule.get('id', '')
+                      lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                      rule_defaults[rid] = lv
+                  # extension rules (CodeQL packs its queries as extensions)
+                  for ext in run.get('tool', {}).get('extensions', []):
+                      for rule in ext.get('rules', []):
+                          rid = rule.get('id', '')
+                          lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                          rule_defaults[rid] = lv
+                  # collect results
+                  all_results.extend(run.get('results', []))
+
+          error   = []
+          warning = []
+          note    = []
+
+          for r in all_results:
+              rid   = r.get('ruleId', '')
+              level = r.get('level') or rule_defaults.get(rid, 'warning')
+              if level == 'error':
+                  error.append(r)
+              elif level == 'warning':
+                  warning.append(r)
+              else:
+                  note.append(r)
 
           print(f"  Error   (High)   : {len(error):3d}  (threshold: {ERROR_THRESHOLD})")
           print(f"  Warning (Medium) : {len(warning):3d}  (threshold: {WARN_THRESHOLD})")
           print(f"  Note    (Low)    : {len(note):3d}")
 
           if error:
-              print("\n  Top HIGH findings:")
+              print("\n  TOP HIGH findings:")
               for r in error[:5]:
-                  rule = r.get('ruleId', 'unknown')
+                  rid  = r.get('ruleId', 'unknown')
                   locs = r.get('locations', [{}])
                   path = locs[0].get('physicalLocation', {}) \
-                                .get('artifactLocation', {}) \
-                                .get('uri', '?')
+                               .get('artifactLocation', {}) \
+                               .get('uri', '?')
                   line = locs[0].get('physicalLocation', {}) \
-                                .get('region', {}) \
-                                .get('startLine', '?')
-                  print(f"    [{rule}] {path}:{line}")
+                               .get('region', {}) \
+                               .get('startLine', '?')
+                  msg  = r.get('message', {}).get('text', '')[:80]
+                  print(f"    [{rid}] {path}:{line}")
+                  print(f"      {msg}")
 
           failures = []
           warnings = []
@@ -434,6 +516,7 @@ jobs:
 
           print("\nCODEQL GATE: PASSED ✓")
           EOF
+
 
       - name: Upload CodeQL artifact
         uses: actions/upload-artifact@v4.6.2
