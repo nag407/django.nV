@@ -632,11 +632,58 @@ jobs:
             --compact
         continue-on-error: true
 
-      - name: Verify Checkov output
+      - name: Debug — confirm Checkov SARIF location and content
         if: always()
         run: |
-          echo "=== Checkov output files ==="
-          find . -maxdepth 2 \( -name "*.sarif" -o -name "results*" \) | sort
+          echo "=== Searching for Checkov SARIF files ==="
+          find . -maxdepth 3 -name "*.sarif" 2>/dev/null | sort
+          echo ""
+          echo "=== Checkov result count (raw) ==="
+          python3 -c "
+          import json, glob
+
+          sarif_files = []
+          for candidate in ['results_sarif.sarif', 'results.sarif', 'checkov.sarif']:
+              import os
+              if os.path.exists(candidate):
+                  sarif_files.append(candidate)
+                  break
+
+          if not sarif_files:
+              sarif_files = glob.glob('**/*.sarif', recursive=True)
+              sarif_files = [f for f in sarif_files
+                             if 'semgrep' not in f and 'codeql' not in f]
+
+          print(f'SARIF files found: {sarif_files}')
+
+          for sf in sarif_files:
+              with open(sf) as f:
+                  data = json.load(f)
+
+              rule_defaults = {}
+              for run in data.get('runs', []):
+                  for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                      rid = rule.get('id', '')
+                      lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                      rule_defaults[rid] = lv
+                  for ext in run.get('tool', {}).get('extensions', []):
+                      for rule in ext.get('rules', []):
+                          rid = rule.get('id', '')
+                          lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                          rule_defaults[rid] = lv
+
+              results = []
+              for run in data.get('runs', []):
+                  results.extend(run.get('results', []))
+
+              levels = {}
+              for r in results:
+                  rid = r.get('ruleId', '')
+                  lv  = r.get('level') or rule_defaults.get(rid, 'warning')
+                  levels[lv] = levels.get(lv, 0) + 1
+
+              print(f'File: {sf}  |  Total: {len(results)}  |  Breakdown: {levels}')
+          "
 
       # ── INLINE GATE ──────────────
       - name: "Gate: Compliance threshold check"
@@ -644,14 +691,10 @@ jobs:
           python3 << 'EOF'
           import json, sys, os, glob
 
-          CRITICAL_THRESHOLD = 0    # zero tolerance on critical
-          HIGH_THRESHOLD     = 5    # warn if high exceeds 5
+          CRITICAL_THRESHOLD = 0
+          HIGH_THRESHOLD     = 5
 
-          print("=" * 50)
-          print("COMPLIANCE GATE — Checkov Results")
-          print("=" * 50)
-
-          # Checkov can write different filenames
+          # Locate Checkov SARIF — try known filenames first, then glob
           sarif_file = None
           for candidate in ['results_sarif.sarif', 'results.sarif', 'checkov.sarif']:
               if os.path.exists(candidate):
@@ -660,10 +703,14 @@ jobs:
 
           if not sarif_file:
               found = glob.glob('**/*.sarif', recursive=True)
+              found = [f for f in found
+                       if 'semgrep' not in f and 'codeql' not in f]
               if found:
                   sarif_file = found[0]
 
-          print(f"  File: {sarif_file or 'NOT FOUND'}")
+          print("=" * 50)
+          print("COMPLIANCE GATE — Checkov Results")
+          print("=" * 50)
 
           if not sarif_file:
               print("  WARNING: No Checkov SARIF found")
@@ -671,27 +718,60 @@ jobs:
               print("\nCOMPLIANCE GATE: PASSED ✓ (no output = nothing to flag)")
               sys.exit(0)
 
+          print(f"  File: {sarif_file}")
+
           with open(sarif_file) as f:
               data = json.load(f)
 
-          results = []
+          # Build rule-level lookup — check both driver and extensions
+          rule_defaults = {}
           for run in data.get('runs', []):
-              results.extend(run.get('results', []))
+              for rule in run.get('tool', {}).get('driver', {}).get('rules', []):
+                  rid = rule.get('id', '')
+                  lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                  rule_defaults[rid] = lv
+              for ext in run.get('tool', {}).get('extensions', []):
+                  for rule in ext.get('rules', []):
+                      rid = rule.get('id', '')
+                      lv  = rule.get('defaultConfiguration', {}).get('level', 'warning')
+                      rule_defaults[rid] = lv
 
-          critical = [r for r in results if r.get('level') == 'error']
-          high     = [r for r in results if r.get('level') == 'warning']
-          low      = [r for r in results if r.get('level') == 'note']
+          all_results = []
+          for run in data.get('runs', []):
+              all_results.extend(run.get('results', []))
+
+          critical = []
+          high     = []
+          low      = []
+
+          for r in all_results:
+              rid   = r.get('ruleId', '')
+              level = r.get('level') or rule_defaults.get(rid, 'warning')
+              if level == 'error':
+                  critical.append(r)
+              elif level == 'warning':
+                  high.append(r)
+              else:
+                  low.append(r)
 
           print(f"  Critical/Error  : {len(critical):3d}  (threshold: {CRITICAL_THRESHOLD})")
           print(f"  High/Warning    : {len(high):3d}  (threshold: {HIGH_THRESHOLD})")
           print(f"  Low/Note        : {len(low):3d}")
 
           if critical:
-              print("\n  CRITICAL findings:")
+              print("\n  TOP CRITICAL findings:")
               for r in critical[:5]:
-                  rule = r.get('ruleId', 'unknown')
-                  msg  = r.get('message', {}).get('text', '')[:60]
-                  print(f"    ✖  [{rule}] {msg}")
+                  rid  = r.get('ruleId', 'unknown')
+                  locs = r.get('locations', [{}])
+                  path = locs[0].get('physicalLocation', {}) \
+                                .get('artifactLocation', {}) \
+                                .get('uri', '?')
+                  line = locs[0].get('physicalLocation', {}) \
+                                .get('region', {}) \
+                                .get('startLine', '?')
+                  msg  = r.get('message', {}).get('text', '')[:80]
+                  print(f"    [{rid}] {path}:{line}")
+                  print(f"      {msg}")
 
           failures = []
           warnings = []
@@ -721,6 +801,7 @@ jobs:
 
           print("\nCOMPLIANCE GATE: PASSED ✓")
           EOF
+
 
       - name: Upload Checkov artifact
         uses: actions/upload-artifact@v4.6.2
