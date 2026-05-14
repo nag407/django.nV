@@ -65,24 +65,26 @@ jobs:
           python manage.py test taskManager
 
   # ────────────────────────────────────────────────────────────────────────────
-  # 3. SCA — Snyk  (EPSS-enriched gate)
+  # 3. SCA — Snyk  (CVSS-score gate)
   # ────────────────────────────────────────────────────────────────────────────
-  # Gate axes:
+  # Gate axes (evaluated in order):
   #
-  #   AXIS 1 — EPSS (primary, via FIRST.org API)
-  #     BLOCK : any CVE with EPSS score >= 0.3  AND severity critical/high
-  #     WARN  : any CVE with EPSS score >= 0.1
+  #   AXIS 1 — CVSS score (primary)
+  #     BLOCK : any finding with cvssScore >= 9.0
+  #     WARN  : any finding with cvssScore >= 7.0
   #
-  #   AXIS 2 — Raw count fallback
-  #     (catches non-NVD advisories that carry no CVE ID → no EPSS score)
-  #     BLOCK : critical > 6  OR  high > 18   (current baseline)
+  #   AXIS 2 — Count fallback
+  #     (catches findings Snyk does not assign a CVSS score)
+  #     BLOCK : critical > 0  OR  high > 5
+  #
+  # Why CVSS over raw counts: 58 findings all come from one package (django).
+  # A single upgrade fixes all of them. Gating on score surfaces the worst
+  # offenders clearly and is more meaningful than a raw tally.
   #
   # Outputs:
-  #   snyk.sarif             → GitHub Security tab
-  #   snyk-results.json      → raw Snyk JSON artifact (unchanged, kept for
-  #                            backwards compat with any downstream tooling)
-  #   snyk_epss_report.json  → enriched report: every CVE + its EPSS score
-  #                            + final gate decision; uploaded as artifact
+  #   snyk-results.json     → raw Snyk JSON (gate input + artifact)
+  #   snyk.sarif            → GitHub Security tab
+  #   snyk_cvss_report.json → gate decision + per-finding CVSS table
   # ────────────────────────────────────────────────────────────────────────────
   oast-snyk:
     runs-on: ubuntu-22.04
@@ -105,10 +107,9 @@ jobs:
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
 
-      # ── Run Snyk — emit both JSON and SARIF ──────────────────────────────
-      # We need JSON for the raw artifact and SARIF for the EPSS gate script.
-      # '|| true' on both — Snyk exits 1 when vulns are found; the gate decides.
-      - name: Run Snyk SCA scan (JSON output)
+      # ── Run Snyk — JSON output (gate input) ──────────────────────────────
+      # '|| true' — Snyk exits 1 when vulns found; the gate script decides.
+      - name: Run Snyk SCA scan
         run: |
           snyk test \
             --file=requirements.txt \
@@ -118,7 +119,8 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Run Snyk SCA scan (SARIF output)
+      # ── Run Snyk again for SARIF → GitHub Security tab ───────────────────
+      - name: Run Snyk SCA scan (SARIF for Security tab)
         run: |
           snyk test \
             --file=requirements.txt \
@@ -127,7 +129,6 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      # ── Upload SARIF to GitHub Security tab ──────────────────────────────
       - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -135,22 +136,21 @@ jobs:
           sarif_file: snyk.sarif
           category: snyk-sca
 
-      # ── EPSS-enriched gate ────────────────────────────────────────────────
-      # Calls FIRST.org EPSS API, scores every CVE found by Snyk,
-      # and blocks/warns based on exploit probability rather than raw counts.
-      # Falls back to raw counts for advisories with no CVE ID.
-      - name: Run EPSS-enriched Snyk gate
+      # ── CVSS gate ─────────────────────────────────────────────────────────
+      # Reads snyk-results.json, gates on cvssScore per finding.
+      # No external API calls — all data is local.
+      - name: Run CVSS gate
         env:
-          EPSS_BLOCK_THRESHOLD: "0.3"   # block if any critical/high CVE has EPSS >= 30%
-          EPSS_WARN_THRESHOLD:  "0.1"   # warn  if any CVE has EPSS >= 10%
-          RAW_CRIT_CEILING:     "6"     # fallback: baseline from django.nV
-          RAW_HIGH_CEILING:     "18"    # fallback: baseline from django.nV
-          WARN_IS_BLOCK:        "false" # set true to make WARN a hard failure
-          SARIF_FILE:           "snyk.sarif"
-        run: python3 .github/scripts/snyk_epss_gate.py
+          CVSS_BLOCK_THRESHOLD: "9.0"   # block if any finding has CVSS >= 9.0
+          CVSS_WARN_THRESHOLD:  "7.0"   # warn  if any finding has CVSS >= 7.0
+          CRIT_CEILING:         "0"     # fallback: block on any critical
+          HIGH_CEILING:         "5"     # fallback: block if high > 5
+          WARN_IS_BLOCK:        "false" # set true to treat WARN as hard failure
+          SNYK_JSON_FILE:       "snyk-results.json"
+        run: python3 .github/scripts/snyk_cvss_gate.py
 
-      # ── Upload both artifacts ─────────────────────────────────────────────
-      - name: Upload raw Snyk JSON artifact
+      # ── Upload artifacts ──────────────────────────────────────────────────
+      - name: Upload Snyk JSON artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -158,12 +158,12 @@ jobs:
           path: snyk-results.json
           retention-days: 14
 
-      - name: Upload EPSS enrichment report
+      - name: Upload CVSS gate report
         uses: actions/upload-artifact@v4
-        if: always()   # upload even on gate block so scores are inspectable
+        if: always()   # upload even on gate block so report is inspectable
         with:
-          name: snyk-epss-report
-          path: snyk_epss_report.json
+          name: snyk-cvss-report
+          path: snyk_cvss_report.json
           retention-days: 30
 
   # ────────────────────────────────
@@ -309,13 +309,10 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # 7. QUALITY GATE
   # ────────────────────────────────────────────────────────────────────────────
-  # NOTE: Snyk is NO LONGER evaluated here.
-  # The oast-snyk job now runs its own inline EPSS gate and fails itself if
-  # the threshold is breached. This job sees oast-snyk as a required
-  # predecessor via 'needs' — if oast-snyk fails, this job never runs,
-  # which already blocks the merge via branch protection.
-  #
-  # This job evaluates: Semgrep · CodeQL · Gitleaks · Checkov
+  # Snyk is evaluated inline by the oast-snyk job (CVSS gate).
+  # If oast-snyk fails, this job never runs — merge is already blocked via
+  # branch protection. This job evaluates: Semgrep · CodeQL · Gitleaks · Checkov
+  # and prints the Snyk CVSS summary for the consolidated pipeline log.
   # ────────────────────────────────────────────────────────────────────────────
   quality-gate:
     runs-on: ubuntu-22.04
@@ -342,29 +339,28 @@ jobs:
           print("=" * 60)
 
           # ──────────────────────────────────────────────────────
-          # NOTE: Snyk gate is handled by oast-snyk job via EPSS.
-          # We print the EPSS summary here for the pipeline log
-          # but do NOT re-gate on it (avoids double-counting).
+          # Snyk summary — gated inline by oast-snyk (CVSS gate).
+          # Print the report here for the consolidated log only.
           # ──────────────────────────────────────────────────────
-          epss_file = f"{RESULTS_DIR}/snyk-epss-report/snyk_epss_report.json"
-          if os.path.exists(epss_file):
-              with open(epss_file) as f:
-                  epss_report = json.load(f)
-              gate    = epss_report.get("gate", "UNKNOWN")
-              reason  = epss_report.get("reason", "")
-              scores  = epss_report.get("epss_scores", {})
-              print(f"\n[SCA - Snyk + EPSS]  (evaluated inline by oast-snyk job)")
+          cvss_file = f"{RESULTS_DIR}/snyk-cvss-report/snyk_cvss_report.json"
+          if os.path.exists(cvss_file):
+              with open(cvss_file) as f:
+                  cvss_report = json.load(f)
+              gate    = cvss_report.get("gate", "UNKNOWN")
+              reason  = cvss_report.get("reason", "")
+              summary = cvss_report.get("summary", {})
+              thresh  = cvss_report.get("thresholds", {})
+              print(f"\n[SCA - Snyk + CVSS]  (evaluated inline by oast-snyk job)")
               print(f"  Gate decision : {gate}")
               print(f"  Reason        : {reason}")
-              if scores:
-                  print(f"  CVEs scored   : {len(scores)}")
-                  for cve, d in sorted(scores.items(),
-                                       key=lambda x: x[1].get('epss', 0),
-                                       reverse=True)[:5]:
-                      pct = d.get('percentile', 0) * 100
-                      print(f"    {cve}  EPSS={d.get('epss',0):.4f}  ({pct:.1f}th pct)")
+              print(f"  Findings      : critical={summary.get('critical',0)}"
+                    f"  high={summary.get('high',0)}"
+                    f"  medium={summary.get('medium',0)}"
+                    f"  low={summary.get('low',0)}")
+              print(f"  Thresholds    : CVSS block>={thresh.get('cvss_block',9.0)}"
+                    f"  warn>={thresh.get('cvss_warn',7.0)}")
           else:
-              warnings.append("SCA: snyk_epss_report.json not found — oast-snyk may have failed before producing it")
+              warnings.append("SCA: snyk_cvss_report.json not found — oast-snyk may have failed before producing it")
 
           # ──────────────────────────────
           # GATE 1: Semgrep SAST
